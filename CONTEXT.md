@@ -290,7 +290,44 @@ Type to search, Tab to change sort, F5 to rescan, Enter or click to open, Esc or
 is a test for it: titles come from files off the internet and must not be able to
 inject into the view.
 
-Next: Phase 5, reading polish — themes, hyphenation, TOC, chrome.
+**Phase 5 in progress** — reading polish. Two of the four are in:
+
+*Hyphenation.* `src/hyphen.rs` runs Knuth-Liang patterns (the `hyphenation`
+crate, `embed_all`) over the text of a chapter and inserts `U+00AD`; Parley's
+UAX-14 breaker does the rest. Patterns are chosen from the book's `dc:language`,
+and an unknown language gets no hyphenation rather than another language's
+rules. `code` and `pre` are left alone.
+
+*Contents.* `src/toc.rs` is the navigation view, HTML/CSS through the same
+pipeline as the grid and the book. `book::read_toc` flattens the EPUB 3 `nav`
+(or the EPUB 2 NCX — rbook falls back on its own) into spine targets. Tab opens
+it from the reading view and closes it again; ↑/↓ select, Enter or a click
+navigates, and it opens on the entry covering where you already are.
+
+Three decisions worth keeping:
+
+- **A full view, not a floating panel.** A panel over the page means two
+  `paint_scene` calls into one scene, and the second resets the first — the same
+  §9 blocker that holds up two-column. Nothing about the model changes when that
+  lifts: the contents are already a standalone flow, so they can be composited
+  into a side panel then.
+- **Entries carry their href fragment**, and navigation resolves it to an
+  element and then to a page. Books that keep several chapters in one spine file
+  would otherwise send every entry to page 1 of it.
+- **Entries that do not resolve to a spine item are dropped, and a book with no
+  usable navigation falls back to its spine.** A dead line is worse than no
+  line, and the contents key should always do something.
+
+`--check` now also reports contents entries, books falling back to the spine,
+and fragments that do not resolve in their chapter — the corpus is the only
+pressure this gets before 1.0 (§13).
+
+Shared plumbing that had to move: all three views are paginated documents, so
+`page_count` and paging are view-aware. That fixed a real bug in passing — the
+library's PageUp/PageDown called the *reading* page turn, which reads the open
+chapter's page count and so did nothing at all with no book open.
+
+Next: chrome — the invisible-chrome toggle, and the Omarchy theme template (§11).
 
 ## 9. Spike findings (verified, not assumed)
 

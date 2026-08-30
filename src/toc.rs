@@ -120,9 +120,11 @@ mod tests {
     #[test]
     fn nesting_indents_and_stops_indenting() {
         let e = [entry("Part", 0, 0), entry("Chapter", 1, 1), entry("Deep", 9, 2)];
-        let out = html(&e, "t", 0, 0);
+        // No chapter in common, so nothing picks up `here` and the depth
+        // classes are all this asserts on.
+        let out = html(&e, "t", 99, 99);
         let css = stylesheet("#fff", "#111", "#888", "#eee");
-        assert!(out.contains(r#"class="row d0 selected""#), "{out}");
+        assert!(out.contains(r#"class="row d0""#), "{out}");
         assert!(out.contains(r#"class="row d1""#));
         assert!(out.contains(&format!(r#"class="row d{MAX_DEPTH}""#)));
         for d in 0..=MAX_DEPTH {

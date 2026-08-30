@@ -319,12 +319,11 @@ impl App {
     }
 
     fn open_toc(&mut self) {
-        let Some(book) = self.book.clone() else { return };
+        let Some(toc) = self.book.as_ref().map(|b| b.toc.clone()) else { return };
         self.resume_page = self.page;
         // Open on the entry covering where you are, not at the top: in a long
         // book the useful part of the contents is the part you are in.
-        self.toc_sel = book
-            .toc
+        self.toc_sel = toc
             .iter()
             .rposition(|e| e.spine <= self.index)
             .unwrap_or(0);
@@ -345,8 +344,7 @@ impl App {
     /// one — books that keep several chapters in one spine file would otherwise
     /// send every entry to page 1.
     fn open_toc_entry(&mut self, i: usize) {
-        let Some(book) = self.book.clone() else { return };
-        let Some(entry) = book.toc.get(i).cloned() else { return };
+        let Some(entry) = self.book.as_ref().and_then(|b| b.toc.get(i).cloned()) else { return };
         self.view = View::Reading;
         if entry.spine == self.index && self.chapter.is_some() {
             self.page = 0;
@@ -374,11 +372,10 @@ impl App {
     }
 
     fn move_toc_selection(&mut self, by: isize) {
-        let Some(book) = self.book.clone() else { return };
-        if book.toc.is_empty() {
-            return;
-        }
-        let last = book.toc.len() as isize - 1;
+        let last = match self.book.as_ref().map(|b| b.toc.len()) {
+            Some(n) if n > 0 => n as isize - 1,
+            _ => return,
+        };
         self.toc_sel = (self.toc_sel as isize + by).clamp(0, last) as usize;
         // Follow the selection onto its page.
         if let Some(page) = self.toc_doc.as_ref().and_then(|d| page_of_index(d, self.toc_sel)) {
@@ -472,7 +469,20 @@ impl App {
     }
 
     fn page_count(&self) -> usize {
-        self.chapter.as_ref().map_or(1, |c| c.pages.count())
+        self.doc().map_or(1, |c| c.pages.count())
+    }
+
+    /// Page a chrome document — library or contents. `turn` is the reading
+    /// version: it crosses chapter boundaries and saves a position, neither of
+    /// which means anything here.
+    fn turn_view(&mut self, forward: bool) {
+        let last = self.page_count().saturating_sub(1);
+        self.page = if forward {
+            (self.page + 1).min(last)
+        } else {
+            self.page.saturating_sub(1)
+        };
+        self.request_redraw();
     }
 
     /// Load a chapter, skipping forward past any the engine chokes on.
@@ -603,12 +613,13 @@ impl App {
     }
 
     fn relayout(&mut self) {
-        if matches!(self.view, View::Library) {
+        if self.view != View::Reading {
             let vp = self.viewport();
             let ph = self.page_height();
-            if let Some(doc) = &mut self.lib_doc {
+            if let Some(doc) = self.doc_mut() {
                 chapter::relayout(doc, vp, ph);
-                self.page = self.page.min(doc.pages.count().saturating_sub(1));
+                let last = doc.pages.count().saturating_sub(1);
+                self.page = self.page.min(last);
             }
             return;
         }
@@ -637,11 +648,7 @@ impl App {
         }
         // Resources belong to whichever document asked for them: cover images
         // for the library, figures for a chapter.
-        let target = match self.view {
-            View::Library => self.lib_doc.as_mut(),
-            View::Reading => self.chapter.as_mut(),
-        };
-        let loaded = match target {
+        let loaded = match self.doc_mut() {
             Some(doc) => catch_unwind(AssertUnwindSafe(|| {
                 for resource in pending {
                     doc.doc.load_resource(resource);
@@ -672,25 +679,31 @@ impl App {
         let page_h = self.page_height();
         let margin = self.page_margin();
         let ground = match self.view {
-            View::Library => {
-                let (bg, ..) = self.style.theme.chrome_colors();
-                parse_hex(bg)
-            }
             View::Reading => {
                 let [r, g, b] = self.style.theme.background_rgb();
                 Color::from_rgb8(r, g, b)
             }
+            _ => {
+                let (bg, ..) = self.style.theme.chrome_colors();
+                parse_hex(bg)
+            }
         };
 
-        // Disjoint field borrows: `render` takes the renderer mutably, the
-        // closure needs the document mutably to set the page offset.
-        let library = matches!(self.view, View::Library);
-        if library && self.lib_doc.is_none() {
-            self.build_library();
+        match self.view {
+            View::Library if self.lib_doc.is_none() => self.build_library(),
+            View::Toc if self.toc_doc.is_none() => self.build_toc(),
+            _ => {}
         }
 
-        let App { renderer, chapter, lib_doc, .. } = self;
-        let Some(ch) = (if library { lib_doc.as_mut() } else { chapter.as_mut() }) else {
+        // Disjoint field borrows: `render` takes the renderer mutably, the
+        // closure needs the document mutably to set the page offset. That rules
+        // out `doc_mut`, which borrows all of `self`.
+        let App { renderer, chapter, lib_doc, toc_doc, view, .. } = self;
+        let Some(ch) = (match view {
+            View::Library => lib_doc.as_mut(),
+            View::Toc => toc_doc.as_mut(),
+            View::Reading => chapter.as_mut(),
+        }) else {
             return;
         };
         let top = ch.pages.top_of(page);
@@ -739,6 +752,7 @@ impl App {
         match self.view {
             View::Library => self.library_key(event_loop, key),
             View::Reading => self.reading_key(event_loop, key),
+            View::Toc => self.toc_key(event_loop, key),
         }
     }
 
@@ -765,12 +779,12 @@ impl App {
             Key::Named(NamedKey::ArrowLeft) => self.move_selection(-1),
             Key::Named(NamedKey::ArrowDown) => self.move_selection(cols),
             Key::Named(NamedKey::ArrowUp) => self.move_selection(-cols),
-            Key::Named(NamedKey::PageDown) => self.turn(true),
-            Key::Named(NamedKey::PageUp) => self.turn(false),
+            Key::Named(NamedKey::PageDown) => self.turn_view(true),
+            Key::Named(NamedKey::PageUp) => self.turn_view(false),
             Key::Named(NamedKey::Space) => {
                 // Space types a space while searching, otherwise pages down.
                 if self.query.is_empty() {
-                    self.turn(true);
+                    self.turn_view(true);
                 } else {
                     self.query.push(' ');
                     self.reload_rows();
@@ -794,22 +808,37 @@ impl App {
         self.request_redraw();
     }
 
-    /// Open the card under the pointer. Coordinates are in CSS px relative to
-    /// the page slice, so the page offset has to come back off the Y.
+    /// Open whatever is under the pointer. Coordinates are in CSS px relative
+    /// to the page slice, so the page offset has to come back off the Y.
     fn on_click(&mut self) {
-        if !matches!(self.view, View::Library) {
+        if self.view == View::Reading {
             return;
         }
-        let Some(doc) = &self.lib_doc else { return };
+        let Some(doc) = self.doc() else { return };
         let margin = self.page_margin();
         let x = self.cursor.0 / self.scale;
         let y = self.cursor.1 / self.scale - margin + doc.pages.top_of(self.page);
 
         let Some(hit) = doc.doc.hit(x, y) else { return };
-        let Some(hash) = card_hash(doc.dom(), hit.node_id) else { return };
-        let Some(i) = self.rows.iter().position(|r| r.hash == hash) else { return };
-        self.selected = i;
-        self.open_selected();
+        match self.view {
+            View::Library => {
+                let Some(hash) = ancestor_attr(doc.dom(), hit.node_id, "data-hash") else {
+                    return;
+                };
+                let Some(i) = self.rows.iter().position(|r| r.hash == hash) else { return };
+                self.selected = i;
+                self.open_selected();
+            }
+            View::Toc => {
+                let Some(i) = ancestor_attr(doc.dom(), hit.node_id, "data-index")
+                    .and_then(|v| v.parse().ok())
+                else {
+                    return;
+                };
+                self.open_toc_entry(i);
+            }
+            View::Reading => {}
+        }
     }
 
     fn cards_per_row(&self) -> isize {
@@ -828,17 +857,9 @@ impl App {
         let last = self.rows.len() as isize - 1;
         self.selected = (self.selected as isize + by).clamp(0, last) as usize;
         // Follow the selection onto its page.
-        if let Some(doc) = &self.lib_doc {
-            if let Some(y) = self.selected_top(doc) {
-                self.page = doc.pages.page_containing(y);
-            }
+        if let Some(page) = self.lib_doc.as_ref().and_then(|d| page_of_index(d, self.selected)) {
+            self.page = page;
         }
-    }
-
-    fn selected_top(&self, doc: &Chapter) -> Option<f32> {
-        let want = self.selected.to_string();
-        let node = find_by_attr(doc.dom(), 0, "data-index", &want)?;
-        chapter::node_top(doc.dom(), node)
     }
 
     fn rescan(&mut self) {
@@ -853,6 +874,7 @@ impl App {
     fn reading_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
         match key {
             Key::Named(NamedKey::Escape) => self.to_library(),
+            Key::Named(NamedKey::Tab) => self.open_toc(),
             Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::PageDown) => self.turn(true),
             Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::PageUp) => self.turn(false),
             Key::Named(NamedKey::Space) => self.turn(true),
@@ -894,6 +916,56 @@ impl App {
             _ => {}
         }
     }
+
+    /// Contents keys are deliberately few: this is a list you pass through, not
+    /// a place to configure anything.
+    fn toc_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
+        match key {
+            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Tab) => {
+                self.close_toc();
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.open_toc_entry(self.toc_sel);
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) => self.move_toc_selection(1),
+            Key::Named(NamedKey::ArrowUp) => self.move_toc_selection(-1),
+            Key::Named(NamedKey::Home) => self.move_toc_selection(isize::MIN / 2),
+            Key::Named(NamedKey::End) => self.move_toc_selection(isize::MAX / 2),
+            Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
+                self.turn_view(true);
+                return;
+            }
+            Key::Named(NamedKey::PageUp) => {
+                self.turn_view(false);
+                return;
+            }
+            Key::Character(c) => match c.as_str() {
+                "q" => {
+                    self.save_position();
+                    event_loop.exit();
+                    return;
+                }
+                "l" => {
+                    self.to_library();
+                    return;
+                }
+                _ => return,
+            },
+            _ => return,
+        }
+        // The selection is baked into the markup, so moving it rebuilds.
+        self.toc_doc = None;
+        self.request_redraw();
+    }
+}
+
+/// The page a `data-index` row falls on. Both list views mark their rows this
+/// way, so the selection can be followed onto its page.
+fn page_of_index(doc: &Chapter, index: usize) -> Option<usize> {
+    let node = find_by_attr(doc.dom(), 0, "data-index", &index.to_string())?;
+    Some(doc.pages.page_containing(chapter::node_top(doc.dom(), node)?))
 }
 
 /// First element under `id` carrying `attr="value"`.
@@ -914,12 +986,12 @@ fn find_by_attr(
         .find_map(|c| find_by_attr(dom, *c, attr, value))
 }
 
-/// Walk up from a hit node to the card that owns it.
-fn card_hash(dom: &blitz_dom::BaseDocument, mut id: usize) -> Option<String> {
+/// Walk up from a hit node to the nearest ancestor carrying `attr`.
+fn ancestor_attr(dom: &blitz_dom::BaseDocument, mut id: usize, attr: &str) -> Option<String> {
     loop {
         let node = dom.get_node(id)?;
         if let blitz_dom::NodeData::Element(el) = &node.data {
-            if let Some(a) = el.attrs.iter().find(|a| &*a.name.local == "data-hash") {
+            if let Some(a) = el.attrs.iter().find(|a| &*a.name.local == attr) {
                 return Some(a.value.to_string());
             }
         }

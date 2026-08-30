@@ -31,6 +31,11 @@ struct Tally {
     panicked: usize,
     cutting: usize,
     stalled: usize,
+    /// Books with no usable navigation, falling back to a bare spine list.
+    no_toc: usize,
+    toc_entries: usize,
+    /// Contents entries pointing at a fragment the chapter does not contain.
+    dangling: usize,
     failed_books: Vec<String>,
 }
 
@@ -58,6 +63,15 @@ pub fn run(paths: &[String]) -> i32 {
         };
         t.books += 1;
 
+        // The contents fall back to the spine when a book has no usable nav
+        // (book::read_toc); that fallback is exactly what this counts.
+        let spine_fallback = book.toc.len() == book.chapter_count()
+            && book.toc.iter().enumerate().all(|(i, e)| e.spine == i && e.fragment.is_none());
+        if spine_fallback {
+            t.no_toc += 1;
+        }
+        t.toc_entries += book.toc.len();
+
         for i in 0..book.chapter_count() {
             let cb: SharedCallback<Resource> = Arc::new(Discard);
             let ch = match chapter::load(&book, i, &style, make_viewport(), page_h, None, cb) {
@@ -73,6 +87,17 @@ pub fn run(paths: &[String]) -> i32 {
 
             if ch.text_len() == 0 && ch.content_height() < 1.0 {
                 t.empty += 1;
+            }
+
+            // A contents entry whose fragment is missing still opens the right
+            // chapter, but at the top of it rather than at the heading.
+            for e in book.toc.iter().filter(|e| e.spine == i) {
+                if let Some(frag) = &e.fragment {
+                    if find_id(ch.dom(), 0, frag).is_none() {
+                        t.dangling += 1;
+                        eprintln!("TOC  {path} ch{} “{}” → #{frag} not found", i + 1, e.label);
+                    }
+                }
             }
 
             let atoms = chapter::collect_atoms(ch.dom());
@@ -110,9 +135,24 @@ pub fn run(paths: &[String]) -> i32 {
         "checked {} books, {} chapters, {} pages | empty {} | engine panics {} | breaks cutting an atom {} | stalls {}",
         t.books, t.chapters, t.pages, t.empty, t.panicked, t.cutting, t.stalled
     );
+    println!(
+        "contents: {} entries | books falling back to the spine {} | dangling fragments {}",
+        t.toc_entries, t.no_toc, t.dangling
+    );
 
     let bad = t.cutting + t.stalled + t.failed_books.len();
     if bad > 0 { 1 } else { 0 }
+}
+
+/// Is there an element with this `id` in the document?
+fn find_id(dom: &blitz_dom::BaseDocument, id: usize, want: &str) -> Option<usize> {
+    let node = dom.get_node(id)?;
+    if let blitz_dom::NodeData::Element(el) = &node.data {
+        if el.attrs.iter().any(|a| &*a.name.local == "id" && &*a.value == want) {
+            return Some(id);
+        }
+    }
+    node.children.iter().find_map(|c| find_id(dom, *c, want))
 }
 
 fn cuts(atoms: &[Atom], y: f32) -> Option<&Atom> {
