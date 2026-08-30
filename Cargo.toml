@@ -10,6 +10,7 @@ blitz-dom = "0.2.4"
 blitz-html = "0.2.0"
 blitz-paint = "0.2.1"
 blitz-traits = "0.2.0"
+hyphenation = { version = "0.8.4", features = ["embed_all"] }
 kurbo = "0.12"
 peniko = "0.5"
 rbook = "0.7.10"

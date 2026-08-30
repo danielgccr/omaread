@@ -4,6 +4,7 @@
 //! entry point here is wrapped: a hostile chapter must not take the app with it.
 
 use crate::book::Book;
+use crate::hyphen::Hyphenator_;
 use crate::net::{BookNetProvider, ORIGIN};
 use crate::paginate::{self, Atom, AtomKind, Pages};
 use crate::style::{self, ReadingStyle};
@@ -188,13 +189,20 @@ pub fn load(
     style: &ReadingStyle,
     viewport: Viewport,
     page_height: f32,
+    hyphenator: Option<&Hyphenator_>,
     net_callback: SharedCallback<Resource>,
 ) -> Result<Chapter, String> {
     let raw = book.chapter_html(index)?;
     let href = book.chapter_href(index).unwrap_or_default().to_owned();
 
     // The whitelist policy: publisher CSS never reaches the engine.
-    let html = style::strip_publisher_css(&raw);
+    let mut html = style::strip_publisher_css(&raw);
+
+    // Justified text without hyphenation opens rivers, badly so in Spanish and
+    // Catalan. Parley breaks on U+00AD, so mark the words before parsing.
+    if let Some(h) = hyphenator {
+        html = crate::hyphen::mark_html(&html, h);
+    }
 
     let base_url = base_url_for(&href);
     let ua = style.stylesheet();

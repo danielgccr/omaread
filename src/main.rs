@@ -9,9 +9,11 @@ mod cfi;
 mod check;
 mod db;
 mod grid;
+mod hyphen;
 mod library;
 mod paginate;
 mod style;
+mod toc;
 
 use anyrender::{PaintScene, WindowRenderer};
 use anyrender_vello::VelloWindowRenderer;
@@ -53,6 +55,17 @@ fn main() {
         std::process::exit(check::run(&args[1..]));
     }
 
+    if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
+        println!(
+            "omaread [book.epub] [chapter]   open the library, or a book\n\
+             omaread --check <book.epub>...  headless conformance run\n\n\
+             Library:  type to search · Enter open · Tab sort · F5 rescan · Esc clear/quit\n\
+             Reading:  ←/→ page · ↑/↓ chapter · Tab contents · t theme · +/- size · l library · q quit\n\
+             Contents: ↑/↓ select · Enter go · Tab or Esc back"
+        );
+        return;
+    }
+
     // Dev convenience: jump straight to a spine item.
     let start = args
         .get(1)
@@ -78,11 +91,14 @@ impl NetCallback<Resource> for ChannelCallback {
     }
 }
 
-/// Which surface is on screen. The library is a document too, so both arms hold
-/// a `Chapter`; only where the HTML comes from differs.
+/// Which surface is on screen. Every arm is a laid-out document — the library
+/// and the contents are HTML/CSS through the same pipeline as a book
+/// (CONTEXT.md §2); only where the markup comes from differs.
+#[derive(Clone, Copy, PartialEq)]
 enum View {
     Library,
     Reading,
+    Toc,
 }
 
 struct App {
@@ -93,12 +109,20 @@ struct App {
     selected: usize,
     /// Rebuilt whenever the query, sort or selection changes.
     lib_doc: Option<Chapter>,
+    /// The contents list. Rebuilt on every open and on every selection move.
+    toc_doc: Option<Chapter>,
+    toc_sel: usize,
+    /// The reading page to come back to when the contents close. All three
+    /// views share `page`, so it has to be put somewhere.
+    resume_page: usize,
     book: Option<Book>,
     db: Option<Arc<Mutex<Db>>>,
     hash: String,
     path: String,
     /// Restored on startup, consumed once the chapter it points at is open.
     pending: Option<cfi::Cfi>,
+    /// Patterns for the book's `dc:language`; None means no hyphenation.
+    hyphenator: Option<hyphen::Hyphenator_>,
     style: ReadingStyle,
     chapter: Option<Chapter>,
     index: usize,
@@ -131,11 +155,15 @@ impl App {
             sort: Sort::Recent,
             selected: 0,
             lib_doc: None,
+            toc_doc: None,
+            toc_sel: 0,
+            resume_page: 0,
             book: None,
             db,
             hash: String::new(),
             path: String::new(),
             pending: None,
+            hyphenator: None,
             style: ReadingStyle::default(),
             chapter: None,
             index: start,
@@ -200,7 +228,17 @@ impl App {
             Some(c) if c.spine < book.chapter_count() => c.spine,
             _ => start,
         };
-        println!("omaread: {} ({} chapters)", book.title, book.chapter_count());
+        self.hyphenator = hyphen::Hyphenator_::for_language(&book.language);
+        println!(
+            "omaread: {} ({} chapters, {})",
+            book.title,
+            book.chapter_count(),
+            match (&book.language, self.hyphenator.is_some()) {
+                (l, true) if !l.is_empty() => format!("hyphenating {l}"),
+                (l, false) if !l.is_empty() => format!("no patterns for {l}"),
+                _ => "no language declared".into(),
+            }
+        );
 
         if let Some(w) = &self.window {
             w.set_title(&format!("{} — Omaread", book.title));
@@ -249,6 +287,103 @@ impl App {
         self.reload_rows();
         self.view = View::Library;
         self.request_redraw();
+    }
+
+    /// The document the current view paints. Every view is one.
+    fn doc(&self) -> Option<&Chapter> {
+        match self.view {
+            View::Library => self.lib_doc.as_ref(),
+            View::Toc => self.toc_doc.as_ref(),
+            View::Reading => self.chapter.as_ref(),
+        }
+    }
+
+    fn doc_mut(&mut self) -> Option<&mut Chapter> {
+        match self.view {
+            View::Library => self.lib_doc.as_mut(),
+            View::Toc => self.toc_doc.as_mut(),
+            View::Reading => self.chapter.as_mut(),
+        }
+    }
+
+    /// Lay out the contents. Cheap next to a chapter, so it is rebuilt on every
+    /// open and every selection move rather than diffed — the same bargain the
+    /// library grid makes.
+    fn build_toc(&mut self) {
+        let Some(book) = self.book.clone() else { return };
+        let (bg, fg, subtle, panel) = self.style.theme.chrome_colors();
+        let html = toc::html(&book.toc, &book.title, self.index, self.toc_sel);
+        let ua = toc::stylesheet(bg, fg, subtle, panel);
+        self.toc_doc =
+            chapter::layout_document(html, ua, None, self.viewport(), self.page_height());
+    }
+
+    fn open_toc(&mut self) {
+        let Some(book) = self.book.clone() else { return };
+        self.resume_page = self.page;
+        // Open on the entry covering where you are, not at the top: in a long
+        // book the useful part of the contents is the part you are in.
+        self.toc_sel = book
+            .toc
+            .iter()
+            .rposition(|e| e.spine <= self.index)
+            .unwrap_or(0);
+        self.view = View::Toc;
+        self.page = 0;
+        self.build_toc();
+        self.page = self.toc_doc.as_ref().and_then(|d| page_of_index(d, self.toc_sel)).unwrap_or(0);
+        self.request_redraw();
+    }
+
+    fn close_toc(&mut self) {
+        self.view = View::Reading;
+        self.page = self.resume_page.min(self.page_count().saturating_sub(1));
+        self.request_redraw();
+    }
+
+    /// Navigate to a contents entry, landing on its fragment's page when it has
+    /// one — books that keep several chapters in one spine file would otherwise
+    /// send every entry to page 1.
+    fn open_toc_entry(&mut self, i: usize) {
+        let Some(book) = self.book.clone() else { return };
+        let Some(entry) = book.toc.get(i).cloned() else { return };
+        self.view = View::Reading;
+        if entry.spine == self.index && self.chapter.is_some() {
+            self.page = 0;
+        } else {
+            self.load_chapter(entry.spine);
+        }
+        if let Some(frag) = &entry.fragment {
+            match self
+                .chapter
+                .as_ref()
+                .and_then(|ch| find_by_attr(ch.dom(), 0, "id", frag))
+                .and_then(|node| {
+                    let ch = self.chapter.as_ref()?;
+                    Some(ch.pages.page_containing(chapter::node_top(ch.dom(), node)?))
+                }) {
+                Some(page) => self.page = page,
+                // A dangling fragment is the book's problem, not the reader's:
+                // the chapter is still the right place to be.
+                None => eprintln!("omaread: contents point at #{frag}, which is not in the chapter"),
+            }
+        }
+        self.resume_page = self.page;
+        self.save_position();
+        self.request_redraw();
+    }
+
+    fn move_toc_selection(&mut self, by: isize) {
+        let Some(book) = self.book.clone() else { return };
+        if book.toc.is_empty() {
+            return;
+        }
+        let last = book.toc.len() as isize - 1;
+        self.toc_sel = (self.toc_sel as isize + by).clamp(0, last) as usize;
+        // Follow the selection onto its page.
+        if let Some(page) = self.toc_doc.as_ref().and_then(|d| page_of_index(d, self.toc_sel)) {
+            self.page = page;
+        }
     }
 
     fn chapter_count(&self) -> usize {
@@ -353,7 +488,8 @@ impl App {
         while index < count {
             let vp = self.viewport();
             let ph = self.page_height();
-            match chapter::load(&book, index, &self.style, vp, ph, self.callback()) {
+            let cb = self.callback();
+            match chapter::load(&book, index, &self.style, vp, ph, self.hyphenator.as_ref(), cb) {
                 Ok(ch) => {
                     if std::env::var_os("OMAREAD_DEBUG_PAGES").is_some() {
                         let atoms = chapter::collect_atoms(ch.dom());
@@ -467,6 +603,15 @@ impl App {
     }
 
     fn relayout(&mut self) {
+        if matches!(self.view, View::Library) {
+            let vp = self.viewport();
+            let ph = self.page_height();
+            if let Some(doc) = &mut self.lib_doc {
+                chapter::relayout(doc, vp, ph);
+                self.page = self.page.min(doc.pages.count().saturating_sub(1));
+            }
+            return;
+        }
         let vp = self.viewport();
         let ph = self.page_height();
         let anchor = self.chapter.as_ref().map_or(0.0, |c| c.pages.top_of(self.page));
@@ -490,10 +635,16 @@ impl App {
         if pending.is_empty() {
             return;
         }
-        let loaded = match &mut self.chapter {
-            Some(ch) => catch_unwind(AssertUnwindSafe(|| {
+        // Resources belong to whichever document asked for them: cover images
+        // for the library, figures for a chapter.
+        let target = match self.view {
+            View::Library => self.lib_doc.as_mut(),
+            View::Reading => self.chapter.as_mut(),
+        };
+        let loaded = match target {
+            Some(doc) => catch_unwind(AssertUnwindSafe(|| {
                 for resource in pending {
-                    ch.doc.load_resource(resource);
+                    doc.doc.load_resource(resource);
                 }
             }))
             .is_ok(),
@@ -662,9 +813,12 @@ impl App {
     }
 
     fn cards_per_row(&self) -> isize {
-        // Card 150px + 12px padding + 30px gap, inside the body's 28px padding.
+        // Cards are border-box, so the pitch is card width plus one gap; the
+        // last card in a row needs no gap, hence the + GAP before dividing.
+        const CARD: f32 = 150.0;
+        const GAP: f32 = 30.0;
         let usable = (self.size.0 as f32 / self.scale) - 56.0;
-        ((usable / 192.0).floor() as isize).max(1)
+        (((usable + GAP) / (CARD + GAP)).floor() as isize).max(1)
     }
 
     fn move_selection(&mut self, by: isize) {
@@ -796,8 +950,11 @@ impl ApplicationHandler for App {
         self.renderer.resume(window.clone(), self.size.0, self.size.1);
         self.window = Some(window);
 
-        let start = self.index;
-        self.load_chapter(start);
+        // The library needs no chapter; only reopen a book if one is open.
+        if matches!(self.view, View::Reading) {
+            let start = self.index;
+            self.load_chapter(start);
+        }
         if let Ok(p) = std::env::var("OMAREAD_START_PAGE") {
             if let Ok(n) = p.parse::<usize>() {
                 self.page = n.saturating_sub(1).min(self.page_count().saturating_sub(1));

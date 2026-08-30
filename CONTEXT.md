@@ -177,6 +177,12 @@ us while blitz-dom is pre-1.0.
   single-format forever; adding a format means writing a converter, not auditing
   every subsystem.
 - Config in `~/.config/omaread/`. Cache: nowhere.
+- Watched folders live in `~/.config/omaread/folders.txt`, one path per line,
+  seeded with `~/Documents` and `~/Downloads` on first run. A newline list rather
+  than TOML: it holds paths and nothing else.
+- **No inotify.** A scan runs at startup and on F5. Live watching is a
+  convenience, not a correctness requirement; add `notify` when rescanning by
+  hand actually becomes annoying.
 
 ## 5. Security and privacy posture
 
@@ -266,7 +272,25 @@ Precision is **paragraph level**: the CFI names the element a page begins at, no
 a character within it. Resuming at a paragraph start is right for a reader;
 character offsets arrive when highlights need them (Phase 7).
 
-Next: Phase 4, the library.
+**Phase 4 complete** — the library. `src/library.rs` scans the watched folders
+(seeded in `~/.config/omaread/folders.txt`, one path per line), identifies books
+by SHA-256, and extracts title, author and cover with `rbook`. Opening a book
+copies it into `~/.local/share/omaread/library/` as `Author - Title.epub`;
+originals are never touched. Files that vanish become ghost rows, keeping their
+reading progress. `src/grid.rs` is the library view, authored in HTML/CSS and
+rendered through the same blitz-dom pipeline as a book — covers come from SQLite
+through a `CoverProvider` on the `omaread-cover://` origin, the same hermetic
+pattern as the book provider.
+
+Measured on the real library: **372 files, 361 unique books** (11 collapsed by
+content hash — the same titles sitting in two folders), **358 with covers**.
+
+Type to search, Tab to change sort, F5 to rescan, Enter or click to open, Esc or
+`l` to come back. Book metadata is escaped on the way into the markup and there
+is a test for it: titles come from files off the internet and must not be able to
+inject into the view.
+
+Next: Phase 5, reading polish — themes, hyphenation, TOC, chrome.
 
 ## 9. Spike findings (verified, not assumed)
 

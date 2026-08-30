@@ -60,7 +60,7 @@ pub fn run(paths: &[String]) -> i32 {
 
         for i in 0..book.chapter_count() {
             let cb: SharedCallback<Resource> = Arc::new(Discard);
-            let ch = match chapter::load(&book, i, &style, make_viewport(), page_h, cb) {
+            let ch = match chapter::load(&book, i, &style, make_viewport(), page_h, None, cb) {
                 Ok(c) => c,
                 Err(_) => {
                     t.panicked += 1;

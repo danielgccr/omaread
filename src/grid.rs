@@ -137,7 +137,7 @@ html .empty {{ padding: 40px 4px; color: {subtle}; font-size: 15px; }}
     )
 }
 
-fn escape(s: &str) -> String {
+pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -201,6 +201,31 @@ mod tests {
         assert!(out.contains("selected"));
         assert!(out.contains("missing"));
         assert!(out.contains("data-index=\"1\""));
+    }
+
+    /// The grid must actually lay out — a failure here means a blank window,
+    /// because a document that does not build never paints a first frame.
+    #[test]
+    fn the_grid_lays_out() {
+        let rows: Vec<BookRow> = (0..40)
+            .map(|i| {
+                let mut r = row(&format!("Libro {i}"), "Autor");
+                r.hash = format!("h{i}");
+                r
+            })
+            .collect();
+        let html = html(&rows, "", Sort::Recent, 0);
+        let ua = stylesheet("#fff", "#111", "#888", "#eee");
+        let doc = crate::chapter::layout_document(
+            html,
+            ua,
+            None,
+            crate::chapter::viewport(1200, 900, 1.0, false),
+            800.0,
+        );
+        let doc = doc.expect("grid document failed to lay out");
+        assert!(doc.content_height() > 100.0, "grid has no height");
+        assert!(doc.text_len() > 0, "grid has no text");
     }
 
     #[test]
