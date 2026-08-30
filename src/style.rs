@@ -37,6 +37,20 @@ impl Theme {
         }
     }
 
+    /// Palette for the app chrome — library grid, panels.
+    ///
+    /// Off Omarchy this is the reader's own neutral ground. Following the
+    /// active Omarchy theme here (CONTEXT.md §11) is the integration still to
+    /// come; the *reading surface* deliberately keeps its own four themes.
+    pub fn chrome_colors(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Theme::White => ("#fbfbfd", "#1c1c1e", "#8e8e93", "#ececf0"),
+            Theme::Sepia => ("#f6efe1", "#4f321c", "#96785f", "#e8ddc6"),
+            Theme::Grey => ("#d6d6d2", "#33332f", "#6e6e6a", "#c4c4bf"),
+            Theme::Night => ("#111113", "#e5e5ea", "#6e6e73", "#232327"),
+        }
+    }
+
     /// (background, text, subtle)
     fn colors(self) -> (&'static str, &'static str, &'static str) {
         match self {

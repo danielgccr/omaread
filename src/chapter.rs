@@ -239,6 +239,20 @@ fn build(
     .map_err(|_| ())
 }
 
+/// Lay out an arbitrary document — used for the library view, which is HTML/CSS
+/// through the same pipeline as a book.
+pub fn layout_document(
+    html: String,
+    ua: String,
+    provider: Option<Arc<dyn NetProvider<Resource>>>,
+    viewport: Viewport,
+    page_height: f32,
+) -> Option<Chapter> {
+    let doc = build(html, ORIGIN.to_string(), ua, provider, viewport).ok()?;
+    let pages = paginate_dom(&doc, page_height);
+    Some(Chapter { doc, index: usize::MAX, pages })
+}
+
 /// Lay out a bare HTML fragment with the reading stylesheet. Used by tests to
 /// assert geometry without needing a book on disk.
 #[cfg(test)]

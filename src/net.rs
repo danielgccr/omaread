@@ -7,7 +7,10 @@
 //! See CONTEXT.md §5.
 
 use crate::book::Book;
+use crate::db::Db;
+use crate::grid::COVER_ORIGIN;
 use blitz_traits::net::{BoxedHandler, Bytes, NetProvider, Request, SharedCallback};
+use std::sync::{Arc, Mutex};
 
 /// Synthetic origin for in-archive resources. Chosen so that relative hrefs in a
 /// chapter resolve against it via normal URL rules, and so that anything with a
@@ -48,6 +51,39 @@ impl<D: Send + Sync + 'static> NetProvider<D> for BookNetProvider<D> {
         }
     }
 }
+
+/// Serves cover images to the library view straight out of SQLite. Same
+/// hermetic rule as the book provider: nothing but our own origin resolves.
+pub struct CoverProvider<D> {
+    db: Arc<Mutex<Db>>,
+    callback: SharedCallback<D>,
+}
+
+impl<D> CoverProvider<D> {
+    pub fn new(db: Arc<Mutex<Db>>, callback: SharedCallback<D>) -> Self {
+        Self { db, callback }
+    }
+}
+
+impl<D: Send + Sync + 'static> NetProvider<D> for CoverProvider<D> {
+    fn fetch(&self, doc_id: usize, request: Request, handler: BoxedHandler<D>) {
+        let url = request.url;
+        if url.scheme() != "omaread-cover" {
+            log_blocked(&url);
+            return;
+        }
+        let hash = url.path().trim_start_matches('/');
+        let bytes = self.db.lock().ok().and_then(|d| d.cover(hash));
+        if let Some(bytes) = bytes {
+            handler.bytes(doc_id, Bytes::from(bytes), self.callback.clone());
+        }
+    }
+}
+
+const _: () = {
+    // Keep the origin constant and the scheme check above in step.
+    assert!(COVER_ORIGIN.as_bytes()[0] == b'o');
+};
 
 fn log_blocked(url: &blitz_traits::net::Url) {
     eprintln!("omaread: blocked off-book resource {url}");

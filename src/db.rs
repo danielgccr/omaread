@@ -10,6 +10,43 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sort {
+    Recent,
+    Title,
+    Author,
+}
+
+impl Sort {
+    pub fn next(self) -> Self {
+        match self {
+            Sort::Recent => Sort::Title,
+            Sort::Title => Sort::Author,
+            Sort::Author => Sort::Recent,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Recent => "Recent",
+            Sort::Title => "Title",
+            Sort::Author => "Author",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BookRow {
+    pub hash: String,
+    pub path: String,
+    pub title: String,
+    pub author: String,
+    pub cover: Option<Vec<u8>>,
+    pub managed: bool,
+    pub missing: bool,
+    pub started: bool,
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -36,6 +73,19 @@ impl Db {
              );",
         )
         .map_err(|e| e.to_string())?;
+
+        // Nothing is owed compatibility before 1.0, so grow the table in place
+        // and let the already-exists errors fall on the floor.
+        for col in [
+            "author TEXT NOT NULL DEFAULT ''",
+            "cover BLOB",
+            "managed INTEGER NOT NULL DEFAULT 0",
+            "missing INTEGER NOT NULL DEFAULT 0",
+            "added_at INTEGER",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE books ADD COLUMN {col}"), []);
+        }
+
         Ok(Self { conn })
     }
 
@@ -61,6 +111,101 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    /// Insert or refresh a book's catalogue entry. Reading progress is left
+    /// alone: re-indexing a book must never lose your place.
+    pub fn upsert_book(&self, b: &BookRow) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO books (file_hash, file_path, title, author, cover, managed, missing, added_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, unixepoch())
+                 ON CONFLICT(file_hash) DO UPDATE SET
+                     file_path = excluded.file_path,
+                     title     = excluded.title,
+                     author    = excluded.author,
+                     cover     = coalesce(excluded.cover, books.cover),
+                     managed   = max(books.managed, excluded.managed),
+                     missing   = 0",
+                params![b.hash, b.path, b.title, b.author, b.cover, b.managed as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn has(&self, hash: &str) -> bool {
+        self.conn
+            .query_row("SELECT 1 FROM books WHERE file_hash = ?1", params![hash], |_| Ok(()))
+            .optional()
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Books, newest-read first unless `sort` says otherwise, filtered by a
+    /// case-insensitive substring of title or author.
+    pub fn books(&self, query: &str, sort: Sort) -> Result<Vec<BookRow>, String> {
+        let order = match sort {
+            Sort::Recent => "coalesce(opened_at, added_at) DESC",
+            Sort::Title => "title COLLATE NOCASE ASC",
+            Sort::Author => "author COLLATE NOCASE ASC, title COLLATE NOCASE ASC",
+        };
+        let like = format!("%{}%", query.trim());
+        let sql = format!(
+            "SELECT file_hash, file_path, title, author, cover, managed, missing,
+                    last_cfi IS NOT NULL
+             FROM books
+             WHERE (?1 = '%%' OR title LIKE ?1 ESCAPE '\\' OR author LIKE ?1 ESCAPE '\\')
+             ORDER BY {order}"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![like], |r| {
+                Ok(BookRow {
+                    hash: r.get(0)?,
+                    path: r.get(1)?,
+                    title: r.get(2)?,
+                    author: r.get(3)?,
+                    cover: r.get(4)?,
+                    managed: r.get::<_, i64>(5)? != 0,
+                    missing: r.get::<_, i64>(6)? != 0,
+                    started: r.get::<_, i64>(7)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn cover(&self, hash: &str) -> Option<Vec<u8>> {
+        self.conn
+            .query_row("SELECT cover FROM books WHERE file_hash = ?1", params![hash], |r| {
+                r.get::<_, Option<Vec<u8>>>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+    }
+
+    /// Flag rows whose file is gone. Ghost rows keep their reading progress
+    /// (CONTEXT.md §4) rather than being deleted.
+    pub fn mark_missing(&self) -> Result<usize, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_hash, file_path FROM books WHERE missing = 0")
+            .map_err(|e| e.to_string())?;
+        let gone: Vec<String> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .filter(|(_, p)| !Path::new(p).exists())
+            .map(|(h, _)| h)
+            .collect();
+        for h in &gone {
+            let _ = self
+                .conn
+                .execute("UPDATE books SET missing = 1 WHERE file_hash = ?1", params![h]);
+        }
+        Ok(gone.len())
+    }
+
     pub fn last_cfi(&self, hash: &str) -> Result<Option<String>, String> {
         self.conn
             .query_row(
@@ -80,6 +225,11 @@ fn data_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("omaread")
+}
+
+/// Where copied books live. Watched folders are never written to.
+pub fn library_dir() -> PathBuf {
+    data_dir().join("library")
 }
 
 /// SHA-256 of a file, streamed.

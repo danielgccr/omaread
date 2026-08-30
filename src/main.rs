@@ -8,6 +8,8 @@ mod net;
 mod cfi;
 mod check;
 mod db;
+mod grid;
+mod library;
 mod paginate;
 mod style;
 
@@ -19,7 +21,9 @@ use peniko::{Color, Fill};
 use blitz_dom::net::Resource;
 use blitz_traits::net::{NetCallback, SharedCallback};
 use book::Book;
-use db::Db;
+use db::{BookRow, Db, Sort};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use chapter::Chapter;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -35,39 +39,30 @@ use winit::window::{Window, WindowId};
 /// something unreadable, so two-column mode silently falls back to one.
 const TWO_COLUMN_MIN_EM: f32 = 2.0 * (MEASURE_EM + 2.0 * GUTTER_EM);
 
+/// `#rrggbb` to a colour. The chrome palette is authored as CSS strings so the
+/// stylesheet and the window ground cannot drift apart.
+fn parse_hex(s: &str) -> Color {
+    let h = s.trim_start_matches('#');
+    let v = u32::from_str_radix(h, 16).unwrap_or(0);
+    Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--check") {
         std::process::exit(check::run(&args[1..]));
     }
 
-    let Some(path) = args.first().cloned() else {
-        eprintln!("usage: omaread <book.epub> [chapter]");
-        eprintln!("       omaread --check <book.epub>...");
-        std::process::exit(2);
-    };
-
-    let book = match Book::open(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("omaread: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    println!("omaread: {} ({} chapters)", book.title, book.chapter_count());
-
     // Dev convenience: jump straight to a spine item.
     let start = args
         .get(1)
-        .cloned()
         .and_then(|s| s.parse::<usize>().ok())
         .map(|n| n.saturating_sub(1))
         .unwrap_or(0);
 
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(book, path.clone(), start);
+    let mut app = App::new(args.first().cloned(), start);
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
@@ -83,9 +78,23 @@ impl NetCallback<Resource> for ChannelCallback {
     }
 }
 
+/// Which surface is on screen. The library is a document too, so both arms hold
+/// a `Chapter`; only where the HTML comes from differs.
+enum View {
+    Library,
+    Reading,
+}
+
 struct App {
-    book: Book,
-    db: Option<Db>,
+    view: View,
+    rows: Vec<BookRow>,
+    query: String,
+    sort: Sort,
+    selected: usize,
+    /// Rebuilt whenever the query, sort or selection changes.
+    lib_doc: Option<Chapter>,
+    book: Option<Book>,
+    db: Option<Arc<Mutex<Db>>>,
     hash: String,
     path: String,
     /// Restored on startup, consumed once the chapter it points at is open.
@@ -102,33 +111,31 @@ struct App {
     net_rx: Receiver<Resource>,
     size: (u32, u32),
     scale: f32,
+    cursor: (f32, f32),
 }
 
 impl App {
-    fn new(book: Book, path: String, start: usize) -> Self {
+    fn new(open: Option<String>, start: usize) -> Self {
         let (net_tx, net_rx) = channel();
 
         // Progress is best-effort: a broken database must never stop you reading.
         let db = Db::open()
             .map_err(|e| eprintln!("omaread: no progress database ({e})"))
-            .ok();
-        let hash = db::file_hash(&path).unwrap_or_default();
-        let pending = db
-            .as_ref()
-            .and_then(|d| d.last_cfi(&hash).ok().flatten())
-            .and_then(|s| cfi::Cfi::parse(&s));
+            .ok()
+            .map(|d| Arc::new(Mutex::new(d)));
 
-        let start = match &pending {
-            Some(c) if c.spine < book.chapter_count() => c.spine,
-            _ => start,
-        };
-
-        Self {
-            book,
+        let mut app = Self {
+            view: View::Library,
+            rows: Vec::new(),
+            query: String::new(),
+            sort: Sort::Recent,
+            selected: 0,
+            lib_doc: None,
+            book: None,
             db,
-            hash,
-            path,
-            pending,
+            hash: String::new(),
+            path: String::new(),
+            pending: None,
             style: ReadingStyle::default(),
             chapter: None,
             index: start,
@@ -140,7 +147,112 @@ impl App {
             net_rx,
             size: (900, 1000),
             scale: 1.0,
+            cursor: (0.0, 0.0),
+        };
+
+        if let Some(db) = app.db.clone() {
+            if let Ok(d) = db.lock() {
+                let (seen, added) = library::scan(&d);
+                println!("omaread: library — {seen} files, {added} newly indexed");
+            }
         }
+        app.reload_rows();
+
+        if let Some(p) = open {
+            app.open_path(&PathBuf::from(p), start);
+        }
+        app
+    }
+
+    fn reload_rows(&mut self) {
+        self.rows = self
+            .db
+            .as_ref()
+            .and_then(|d| d.lock().ok()?.books(&self.query, self.sort).ok())
+            .unwrap_or_default();
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.lib_doc = None;
+    }
+
+    /// Import if needed, then open for reading.
+    fn open_path(&mut self, path: &Path, start: usize) {
+        let path = match self.db.as_ref().and_then(|d| d.lock().ok()) {
+            Some(db) => library::import(&db, path),
+            None => path.to_path_buf(),
+        };
+        let book = match Book::open(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("omaread: {e}");
+                return;
+            }
+        };
+
+        self.hash = db::file_hash(&path).unwrap_or_default();
+        self.pending = self
+            .db
+            .as_ref()
+            .and_then(|d| d.lock().ok()?.last_cfi(&self.hash).ok().flatten())
+            .and_then(|s| cfi::Cfi::parse(&s));
+        self.path = path.to_string_lossy().into_owned();
+
+        let start = match &self.pending {
+            Some(c) if c.spine < book.chapter_count() => c.spine,
+            _ => start,
+        };
+        println!("omaread: {} ({} chapters)", book.title, book.chapter_count());
+
+        if let Some(w) = &self.window {
+            w.set_title(&format!("{} — Omaread", book.title));
+        }
+        self.book = Some(book);
+        self.index = start;
+        self.view = View::Reading;
+        self.load_chapter(start);
+        self.request_redraw();
+    }
+
+    fn open_selected(&mut self) {
+        let Some(row) = self.rows.get(self.selected).cloned() else { return };
+        if row.missing {
+            eprintln!("omaread: {} is missing from disk", row.title);
+            return;
+        }
+        self.open_path(&PathBuf::from(&row.path), 0);
+    }
+
+    /// Lay out the library grid. Rebuilt on any change to query, sort or
+    /// selection — the whole document is cheap next to a chapter, and an
+    /// incremental DOM diff is complexity nobody has asked for.
+    fn build_library(&mut self) {
+        let (bg, fg, subtle, panel) = self.style.theme.chrome_colors();
+        let html = grid::html(&self.rows, &self.query, self.sort, self.selected);
+        let ua = grid::stylesheet(bg, fg, subtle, panel);
+
+        let provider = self.db.clone().map(|db| {
+            Arc::new(net::CoverProvider::new(db, self.callback()))
+                as Arc<dyn blitz_traits::net::NetProvider<Resource>>
+        });
+
+        self.lib_doc =
+            chapter::layout_document(html, ua, provider, self.viewport(), self.page_height());
+        self.page = self
+            .page
+            .min(self.lib_doc.as_ref().map_or(0, |c| c.pages.count().saturating_sub(1)));
+    }
+
+    fn to_library(&mut self) {
+        self.save_position();
+        if let Some(w) = &self.window {
+            w.set_title("Omaread");
+        }
+        self.reload_rows();
+        self.view = View::Library;
+        self.request_redraw();
+    }
+
+    fn chapter_count(&self) -> usize {
+        self.book.as_ref().map_or(0, |b| b.chapter_count())
     }
 
     fn callback(&self) -> SharedCallback<Resource> {
@@ -209,10 +321,12 @@ impl App {
     /// Anchor the current page to a CFI and store it.
     fn save_position(&self) {
         let (Some(db), Some(ch)) = (&self.db, &self.chapter) else { return };
+        let Ok(db) = db.lock() else { return };
         let top = ch.pages.top_of(self.page);
         let Some(node) = chapter::node_at(ch.dom(), top) else { return };
         let Some(c) = cfi::of_node(ch.dom(), node, self.index) else { return };
-        if let Err(e) = db.save_progress(&self.hash, &self.path, &self.book.title, &c.to_string())
+        let title = self.book.as_ref().map(|b| b.title.as_str()).unwrap_or("");
+        if let Err(e) = db.save_progress(&self.hash, &self.path, title, &c.to_string())
         {
             eprintln!("omaread: could not save position: {e}");
         }
@@ -234,11 +348,12 @@ impl App {
     /// `backwards` opens the chapter on its last page, for turning back across a
     /// chapter boundary.
     fn load_chapter_at(&mut self, mut index: usize, backwards: bool) {
-        let count = self.book.chapter_count();
+        let Some(book) = self.book.clone() else { return };
+        let count = book.chapter_count();
         while index < count {
             let vp = self.viewport();
             let ph = self.page_height();
-            match chapter::load(&self.book, index, &self.style, vp, ph, self.callback()) {
+            match chapter::load(&book, index, &self.style, vp, ph, self.callback()) {
                 Ok(ch) => {
                     if std::env::var_os("OMAREAD_DEBUG_PAGES").is_some() {
                         let atoms = chapter::collect_atoms(ch.dom());
@@ -302,7 +417,7 @@ impl App {
             let last = self.page_count().saturating_sub(1);
             if self.page + step <= last {
                 self.page += step;
-            } else if self.index + 1 < self.book.chapter_count() {
+            } else if self.index + 1 < self.chapter_count() {
                 self.load_chapter(self.index + 1);
             } else {
                 return;
@@ -329,7 +444,7 @@ impl App {
                 None => return,
             }
         };
-        if next < self.book.chapter_count() {
+        if next < self.chapter_count() {
             self.load_chapter(next);
             self.request_redraw();
         }
@@ -405,13 +520,28 @@ impl App {
         let page = self.page;
         let page_h = self.page_height();
         let margin = self.page_margin();
-        let [r, g, b] = self.style.theme.background_rgb();
-        let ground = Color::from_rgb8(r, g, b);
+        let ground = match self.view {
+            View::Library => {
+                let (bg, ..) = self.style.theme.chrome_colors();
+                parse_hex(bg)
+            }
+            View::Reading => {
+                let [r, g, b] = self.style.theme.background_rgb();
+                Color::from_rgb8(r, g, b)
+            }
+        };
 
         // Disjoint field borrows: `render` takes the renderer mutably, the
         // closure needs the document mutably to set the page offset.
-        let App { renderer, chapter, .. } = self;
-        let Some(ch) = chapter else { return };
+        let library = matches!(self.view, View::Library);
+        if library && self.lib_doc.is_none() {
+            self.build_library();
+        }
+
+        let App { renderer, chapter, lib_doc, .. } = self;
+        let Some(ch) = (if library { lib_doc.as_mut() } else { chapter.as_mut() }) else {
+            return;
+        };
         let top = ch.pages.top_of(page);
         if std::env::var_os("OMAREAD_DEBUG_PAINT").is_some() {
             eprintln!(
@@ -455,11 +585,120 @@ impl App {
     }
 
     fn on_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
+        match self.view {
+            View::Library => self.library_key(event_loop, key),
+            View::Reading => self.reading_key(event_loop, key),
+        }
+    }
+
+    fn library_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
+        let cols = self.cards_per_row();
         match key {
             Key::Named(NamedKey::Escape) => {
-                self.save_position();
-                event_loop.exit();
+                if self.query.is_empty() {
+                    event_loop.exit();
+                } else {
+                    self.query.clear();
+                    self.reload_rows();
+                }
             }
+            Key::Named(NamedKey::Enter) => {
+                self.open_selected();
+                return;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.query.pop();
+                self.reload_rows();
+            }
+            Key::Named(NamedKey::ArrowRight) => self.move_selection(1),
+            Key::Named(NamedKey::ArrowLeft) => self.move_selection(-1),
+            Key::Named(NamedKey::ArrowDown) => self.move_selection(cols),
+            Key::Named(NamedKey::ArrowUp) => self.move_selection(-cols),
+            Key::Named(NamedKey::PageDown) => self.turn(true),
+            Key::Named(NamedKey::PageUp) => self.turn(false),
+            Key::Named(NamedKey::Space) => {
+                // Space types a space while searching, otherwise pages down.
+                if self.query.is_empty() {
+                    self.turn(true);
+                } else {
+                    self.query.push(' ');
+                    self.reload_rows();
+                }
+            }
+            // Typing searches. Sort and rescan need a modifier-free key that is
+            // not a letter, so they live on F5 and Tab.
+            Key::Named(NamedKey::Tab) => {
+                self.sort = self.sort.next();
+                println!("omaread: sorted by {}", self.sort.label());
+                self.reload_rows();
+            }
+            Key::Named(NamedKey::F5) => self.rescan(),
+            Key::Character(c) => {
+                self.query.push_str(c.as_str());
+                self.reload_rows();
+            }
+            _ => return,
+        }
+        self.lib_doc = None;
+        self.request_redraw();
+    }
+
+    /// Open the card under the pointer. Coordinates are in CSS px relative to
+    /// the page slice, so the page offset has to come back off the Y.
+    fn on_click(&mut self) {
+        if !matches!(self.view, View::Library) {
+            return;
+        }
+        let Some(doc) = &self.lib_doc else { return };
+        let margin = self.page_margin();
+        let x = self.cursor.0 / self.scale;
+        let y = self.cursor.1 / self.scale - margin + doc.pages.top_of(self.page);
+
+        let Some(hit) = doc.doc.hit(x, y) else { return };
+        let Some(hash) = card_hash(doc.dom(), hit.node_id) else { return };
+        let Some(i) = self.rows.iter().position(|r| r.hash == hash) else { return };
+        self.selected = i;
+        self.open_selected();
+    }
+
+    fn cards_per_row(&self) -> isize {
+        // Card 150px + 12px padding + 30px gap, inside the body's 28px padding.
+        let usable = (self.size.0 as f32 / self.scale) - 56.0;
+        ((usable / 192.0).floor() as isize).max(1)
+    }
+
+    fn move_selection(&mut self, by: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let last = self.rows.len() as isize - 1;
+        self.selected = (self.selected as isize + by).clamp(0, last) as usize;
+        // Follow the selection onto its page.
+        if let Some(doc) = &self.lib_doc {
+            if let Some(y) = self.selected_top(doc) {
+                self.page = doc.pages.page_containing(y);
+            }
+        }
+    }
+
+    fn selected_top(&self, doc: &Chapter) -> Option<f32> {
+        let want = self.selected.to_string();
+        let node = find_by_attr(doc.dom(), 0, "data-index", &want)?;
+        chapter::node_top(doc.dom(), node)
+    }
+
+    fn rescan(&mut self) {
+        let Some(db) = self.db.clone() else { return };
+        if let Ok(d) = db.lock() {
+            let (seen, added) = library::scan(&d);
+            println!("omaread: rescan — {seen} files, {added} new");
+        }
+        self.reload_rows();
+    }
+
+    fn reading_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
+        match key {
+            Key::Named(NamedKey::Escape) => self.to_library(),
             Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::PageDown) => self.turn(true),
             Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::PageUp) => self.turn(false),
             Key::Named(NamedKey::Space) => self.turn(true),
@@ -470,6 +709,7 @@ impl App {
                     self.save_position();
                     event_loop.exit();
                 }
+                "l" => self.to_library(),
                 "c" => {
                     println!(
                         "omaread: two-column is not paintable yet (blitz-paint resets the scene)"
@@ -502,13 +742,44 @@ impl App {
     }
 }
 
+/// First element under `id` carrying `attr="value"`.
+fn find_by_attr(
+    dom: &blitz_dom::BaseDocument,
+    id: usize,
+    attr: &str,
+    value: &str,
+) -> Option<usize> {
+    let node = dom.get_node(id)?;
+    if let blitz_dom::NodeData::Element(el) = &node.data {
+        if el.attrs.iter().any(|a| &*a.name.local == attr && &*a.value == value) {
+            return Some(id);
+        }
+    }
+    node.children
+        .iter()
+        .find_map(|c| find_by_attr(dom, *c, attr, value))
+}
+
+/// Walk up from a hit node to the card that owns it.
+fn card_hash(dom: &blitz_dom::BaseDocument, mut id: usize) -> Option<String> {
+    loop {
+        let node = dom.get_node(id)?;
+        if let blitz_dom::NodeData::Element(el) = &node.data {
+            if let Some(a) = el.attrs.iter().find(|a| &*a.name.local == "data-hash") {
+                return Some(a.value.to_string());
+            }
+        }
+        id = node.parent?;
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title(format!("{} — Omaread", self.book.title))
+            .with_title("Omaread")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 1000.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
@@ -547,6 +818,17 @@ impl ApplicationHandler for App {
                 self.renderer.set_size(self.size.0, self.size.1);
                 self.relayout();
                 self.request_redraw();
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+            }
+
+            WindowEvent::MouseInput { state, button, .. }
+                if state == ElementState::Pressed
+                    && button == winit::event::MouseButton::Left =>
+            {
+                self.on_click();
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
