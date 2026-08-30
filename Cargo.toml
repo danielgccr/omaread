@@ -1,0 +1,18 @@
+[package]
+name = "omaread"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyrender = "0.6"
+anyrender_vello = "0.6"
+blitz-dom = "0.2.4"
+blitz-html = "0.2.0"
+blitz-paint = "0.2.1"
+blitz-traits = "0.2.0"
+kurbo = "0.12"
+peniko = "0.5"
+rbook = "0.7.10"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.11.0"
+winit = "0.30.13"
