@@ -11,10 +11,29 @@ use crate::style::{self, ReadingStyle};
 use blitz_dom::net::Resource;
 use blitz_dom::{BaseDocument, DocumentConfig};
 use blitz_html::HtmlDocument;
-use blitz_traits::net::{NetProvider, SharedCallback};
+use blitz_traits::net::{Bytes, NetProvider, SharedCallback};
 use blitz_traits::shell::{ColorScheme, Viewport};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+
+/// The bundled reading faces, embedded in the binary (CONTEXT.md §3). Books'
+/// own `@font-face` is ignored, so these are the faces the reader uses; the
+/// system's fonts remain only as a last resort for glyphs none of these carry.
+///
+/// Literata ships as a variable font: fontique reads its `wght` axis and sets
+/// the weight from CSS, so one file per slant covers every weight the base
+/// stylesheet asks for. Charis SIL is here for coverage Literata lacks, and
+/// carries no bold — a fallback face reached for a rare glyph can synthesise
+/// one.
+const FONTS: [&[u8]; 7] = [
+    include_bytes!("../assets/fonts/Literata-Variable.ttf"),
+    include_bytes!("../assets/fonts/Literata-Italic-Variable.ttf"),
+    include_bytes!("../assets/fonts/CharisSIL-Regular.ttf"),
+    include_bytes!("../assets/fonts/CharisSIL-Italic.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexMono-Bold.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexMono-Italic.ttf"),
+];
 
 pub struct Chapter {
     pub doc: HtmlDocument,
@@ -77,6 +96,8 @@ pub fn collect_atoms(dom: &BaseDocument) -> Vec<Atom> {
     let mut atoms = Vec::new();
     // (absolute y of each cell, height, owning table id) before banding.
     let mut cells: Vec<(f32, f32, usize)> = Vec::new();
+    // Atoms found inside a table, held back to be absorbed into row bands.
+    let mut in_table: Vec<Atom> = Vec::new();
 
     fn walk(
         dom: &BaseDocument,
@@ -85,6 +106,7 @@ pub fn collect_atoms(dom: &BaseDocument) -> Vec<Atom> {
         table: Option<usize>,
         atoms: &mut Vec<Atom>,
         cells: &mut Vec<(f32, f32, usize)>,
+        in_table: &mut Vec<Atom>,
     ) {
         let Some(node) = dom.get_node(id) else { return };
         let l = &node.final_layout;
@@ -103,13 +125,14 @@ pub fn collect_atoms(dom: &BaseDocument) -> Vec<Atom> {
                     }
                 }
                 "img" | "svg" | "hr" | "video" if l.size.height > 0.0 => {
-                    atoms.push(Atom {
+                    let atom = Atom {
                         top: abs_y,
                         bottom: abs_y + l.size.height,
                         group: id,
                         kind: AtomKind::Block,
                         keep_with_next: false,
-                    });
+                    };
+                    if table.is_some() { in_table.push(atom) } else { atoms.push(atom) }
                 }
                 _ => {}
             }
@@ -123,24 +146,25 @@ pub fn collect_atoms(dom: &BaseDocument) -> Vec<Atom> {
                     let top = content_top + m.min_coord;
                     let bottom = content_top + m.max_coord;
                     if bottom > top {
-                        atoms.push(Atom {
+                        let atom = Atom {
                             top,
                             bottom,
                             group: id,
                             kind: AtomKind::Line,
                             keep_with_next: heading,
-                        });
+                        };
+                        if table.is_some() { in_table.push(atom) } else { atoms.push(atom) }
                     }
                 }
             }
         }
 
         for child in &node.children {
-            walk(dom, *child, abs_y, table, atoms, cells);
+            walk(dom, *child, abs_y, table, atoms, cells, in_table);
         }
     }
 
-    walk(dom, 0, 0.0, None, &mut atoms, &mut cells);
+    walk(dom, 0, 0.0, None, &mut atoms, &mut cells, &mut in_table);
 
     // Band the cells: same table, same top (within a pixel) is one row.
     let mut bands: Vec<Atom> = Vec::new();
@@ -165,20 +189,67 @@ pub fn collect_atoms(dom: &BaseDocument) -> Vec<Atom> {
         i = j;
     }
 
-    // Inside a table the *row* is the atom. The lines within a cell overlap their
-    // band, and if they are kept they veto breaks at the very row boundaries the
-    // band exists to provide — producing a chain of overlapping atoms with no
-    // legal break, which forced a hard cut through a line. Drop them.
-    if !bands.is_empty() {
-        atoms.retain(|a| {
-            !bands
-                .iter()
-                .any(|b| a.top >= b.top && a.bottom <= b.bottom)
-        });
-        atoms.extend(bands);
-    }
+    // Inside a table the *row* is the atom. Lines within a cell overlap their
+    // band, and keeping them vetoes breaks at the very row boundaries the band
+    // exists to provide — a chain of overlapping atoms with no legal break,
+    // which forces a hard cut. So they are absorbed instead.
+    atoms.extend(absorb_into_bands(&mut bands, &in_table));
+    separate_bands(&mut bands);
+    atoms.extend(bands);
 
     atoms
+}
+
+/// Pull overlapping row bands apart so that every row boundary is a legal break
+/// again.
+///
+/// Growing a band over a line that overflowed its cell can push its bottom past
+/// the next band's top, and a run of those turns a table into one unbroken
+/// forbidden span — longer than a page, so the paginator has no choice but to
+/// cut. Seen for real: thirteen bands chained across 1022px of a 900px page.
+///
+/// The later band yields, not the earlier one. The overlap exists because text
+/// from the earlier row hangs into the next row's box, so the break belongs
+/// *below* that text; clamping the earlier band instead would put it straight
+/// through the glyphs. A band the previous one now covers entirely is dropped —
+/// that coverage is not lost, it moved.
+fn separate_bands(bands: &mut Vec<Atom>) {
+    bands.sort_by(|a, b| a.top.total_cmp(&b.top));
+    let mut floor = f32::NEG_INFINITY;
+    bands.retain_mut(|band| {
+        band.top = band.top.max(floor);
+        floor = floor.max(band.bottom);
+        band.bottom > band.top
+    });
+}
+
+/// Fold each in-table atom into the row band it overlaps most, growing the band
+/// to cover it. Returns the atoms that belong to no band at all — a `<caption>`,
+/// say — which stay atoms in their own right.
+///
+/// Growing matters as much as dropping. A band is derived from the *cell boxes*,
+/// and a cell box can be shorter than the line inside it: table layout sizes the
+/// row, and a taller face overflows it. A line left sticking out of its band is
+/// a break the paginator can neither take nor snap past, and the whole page runs
+/// out of legal breaks. Seen for real once the bundled faces landed — see §9.
+fn absorb_into_bands(bands: &mut [Atom], inner: &[Atom]) -> Vec<Atom> {
+    let overlap = |b: &Atom, a: &Atom| b.bottom.min(a.bottom) - b.top.max(a.top);
+    let mut orphans = Vec::new();
+
+    for atom in inner {
+        let best = bands
+            .iter_mut()
+            .filter(|b| overlap(b, atom) > 0.0)
+            .max_by(|x, y| overlap(x, atom).total_cmp(&overlap(y, atom)));
+        match best {
+            Some(band) => {
+                band.top = band.top.min(atom.top);
+                band.bottom = band.bottom.max(atom.bottom);
+            }
+            None => orphans.push(*atom),
+        }
+    }
+    orphans
 }
 
 /// Load and lay out one chapter. Returns `Err` rather than unwinding if the
@@ -241,6 +312,19 @@ fn build(
                 ..Default::default()
             },
         );
+
+        // Before the first resolve, or the first layout measures the wrong
+        // faces.
+        //
+        // ponytail: registered per document rather than shared through
+        // `DocumentConfig::font_ctx`. Supplying that field makes blitz skip
+        // registering its own list-bullet font, and that font is `pub(crate)`,
+        // so a shared context costs `<li>` markers. Share one — and vendor a
+        // bullet font — if this ever shows up in a profile.
+        for face in FONTS {
+            doc.load_resource(Resource::Font(Bytes::from_static(face)));
+        }
+
         doc.resolve(0.0);
         doc
     }))
@@ -373,6 +457,133 @@ fn content_height(dom: &BaseDocument) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use super::absorb_into_bands;
+    use crate::paginate::{Atom, AtomKind};
+
+    fn atom(top: f32, bottom: f32, kind: AtomKind) -> Atom {
+        Atom { top, bottom, group: 1, kind, keep_with_next: false }
+    }
+
+    /// A cell box can be shorter than the line inside it, so a row band has to
+    /// grow over its lines rather than only swallow the ones that already fit.
+    /// The real case: band 4577..4604 holding a 29px line at 4586..4615, which
+    /// left an atom sticking 11px out of the row and cost the page every legal
+    /// break it had.
+    #[test]
+    fn a_row_band_grows_over_a_line_that_overflows_its_cell() {
+        let mut bands = [atom(4577.0, 4604.0, AtomKind::Row)];
+        let line = atom(4586.0, 4615.0, AtomKind::Line);
+
+        let orphans = absorb_into_bands(&mut bands, &[line]);
+
+        assert!(orphans.is_empty(), "the line belongs to the row, not to the flow");
+        assert_eq!((bands[0].top, bands[0].bottom), (4577.0, 4615.0));
+        assert!(!bands[0].splits(4620.0), "a break past the grown band is legal");
+        assert!(bands[0].splits(4610.0), "a break inside it still is not");
+    }
+
+    /// Lines go to the band they sit in, not merely the first one they touch.
+    #[test]
+    fn a_line_lands_in_the_band_it_overlaps_most() {
+        let mut bands = [
+            atom(100.0, 130.0, AtomKind::Row),
+            atom(130.0, 200.0, AtomKind::Row),
+        ];
+        let orphans = absorb_into_bands(&mut bands, &[atom(128.0, 160.0, AtomKind::Line)]);
+
+        assert!(orphans.is_empty());
+        assert_eq!(bands[0].bottom, 130.0, "the band it barely touches must not grow");
+        assert_eq!(bands[1].top, 128.0);
+    }
+
+    /// Chained bands leave a table with no legal break anywhere in it, so the
+    /// paginator cuts. Pulling them apart puts a break back on every boundary.
+    #[test]
+    fn overlapping_row_bands_are_pulled_apart() {
+        let mut bands = vec![
+            atom(4577.0, 4615.0, AtomKind::Row),
+            atom(4604.0, 4758.0, AtomKind::Row),
+            atom(4754.0, 4823.0, AtomKind::Row),
+        ];
+        super::separate_bands(&mut bands);
+
+        let edges: Vec<(f32, f32)> = bands.iter().map(|b| (b.top, b.bottom)).collect();
+        assert_eq!(edges, [(4577.0, 4615.0), (4615.0, 4758.0), (4758.0, 4823.0)]);
+        for b in &bands {
+            assert!(!b.splits(4615.0) && !b.splits(4758.0), "a row boundary must be breakable");
+        }
+    }
+
+    /// A band the previous one swallowed whole has nothing left to contribute;
+    /// keeping it as a zero- or negative-height atom would be a break veto at a
+    /// point with no content.
+    #[test]
+    fn a_band_swallowed_whole_is_dropped() {
+        let mut bands = vec![
+            atom(100.0, 400.0, AtomKind::Row),
+            atom(120.0, 300.0, AtomKind::Row),
+            atom(390.0, 450.0, AtomKind::Row),
+        ];
+        super::separate_bands(&mut bands);
+
+        let edges: Vec<(f32, f32)> = bands.iter().map(|b| (b.top, b.bottom)).collect();
+        assert_eq!(edges, [(100.0, 400.0), (400.0, 450.0)]);
+    }
+
+    /// Content inside a table but outside every row — a caption — is still an
+    /// atom of its own; dropping it would let a break cut straight through it.
+    #[test]
+    fn table_content_outside_every_row_stays_an_atom() {
+        let mut bands = [atom(100.0, 130.0, AtomKind::Row)];
+        let caption = atom(60.0, 90.0, AtomKind::Line);
+
+        let orphans = absorb_into_bands(&mut bands, &[caption]);
+
+        assert_eq!(orphans.len(), 1);
+        assert_eq!((orphans[0].top, orphans[0].bottom), (60.0, 90.0));
+        assert_eq!((bands[0].top, bands[0].bottom), (100.0, 130.0));
+    }
+
+    /// The bundled faces must register, and must register under exactly the
+    /// family names the stylesheets ask for. A truncated download or a font
+    /// renamed upstream would otherwise fail silently: layout falls back to a
+    /// system face and everything still *looks* like text.
+    #[test]
+    fn the_bundled_faces_register_under_the_names_the_stylesheets_ask_for() {
+        use fontique::{Blob, Collection, CollectionOptions};
+        use std::sync::Arc;
+
+        let sheet = crate::style::ReadingStyle::default().stylesheet();
+        let mut collection = Collection::new(CollectionOptions {
+            system_fonts: false,
+            ..Default::default()
+        });
+
+        let mut families = Vec::new();
+        for (i, face) in super::FONTS.iter().enumerate() {
+            let blob = Blob::new(Arc::new(*face) as _);
+            let registered = collection.register_fonts(blob, None);
+            assert!(!registered.is_empty(), "bundled face {i} registered nothing");
+            for (family, fonts) in registered {
+                assert!(!fonts.is_empty(), "bundled face {i} registered no fonts");
+                let name = collection
+                    .family_name(family)
+                    .expect("registered family has no name")
+                    .to_string();
+                assert!(
+                    sheet.contains(&name),
+                    "bundled family {name:?} is not named by the reading stylesheet, \
+                     so nothing will ever use it"
+                );
+                families.push(name);
+            }
+        }
+
+        families.sort();
+        families.dedup();
+        assert_eq!(families, ["Charis SIL", "IBM Plex Mono", "Literata"]);
+    }
+
     use super::*;
     use crate::cfi;
     use crate::net::ORIGIN;

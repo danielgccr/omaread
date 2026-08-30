@@ -17,3 +17,8 @@ rbook = "0.7.10"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.11.0"
 winit = "0.30.13"
+
+[dev-dependencies]
+# Already in the tree, pinned by blitz-dom. Only the font test names it: it
+# needs `Blob` to hand a bundled face to a `Collection` directly.
+fontique = "0.6"

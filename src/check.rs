@@ -113,6 +113,20 @@ pub fn run(paths: &[String]) -> i32 {
                     );
                     // What else covers this offset? A break is impossible inside
                     // an atom taller than a page, so name the culprit.
+                    if std::env::var_os("OMAREAD_DEBUG_ATOMS").is_some() {
+                        let lo = top - page_h;
+                        let mut near: Vec<_> = atoms
+                            .iter()
+                            .filter(|o| o.bottom > lo && o.top < top + 80.0)
+                            .collect();
+                        near.sort_by(|a, b| a.top.total_cmp(&b.top));
+                        for o in near {
+                            eprintln!(
+                                "       atom {:?} {:.1}..{:.1} group {}",
+                                o.kind, o.top, o.bottom, o.group
+                            );
+                        }
+                    }
                     for o in atoms.iter().filter(|o| o.splits(top)) {
                         eprintln!(
                             "       covered by {:?} {:.1}..{:.1} (height {:.1}, page {:.1})",

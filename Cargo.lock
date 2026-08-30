@@ -2262,6 +2262,7 @@ dependencies = [
  "blitz-html",
  "blitz-paint",
  "blitz-traits",
+ "fontique",
  "hyphenation",
  "kurbo 0.12.0",
  "peniko",

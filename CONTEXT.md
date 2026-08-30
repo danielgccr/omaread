@@ -67,6 +67,31 @@ Ship Literata, Charis SIL, and a monospace face. All OFL — bundling in an
 application binary is permitted; ship the license texts. Modification requires
 renaming, so don't modify them.
 
+Shipped, in `assets/fonts/`, all from `google/fonts`, each with its `OFL.txt`
+(~3.7MB embedded via `include_bytes!`):
+
+| Face | Files | Why |
+|---|---|---|
+| Literata | variable, upright + italic | the reading face |
+| Charis SIL | static regular + italic | coverage Literata lacks |
+| IBM Plex Mono | static regular, bold, italic | `pre` / `code` |
+
+Literata is a **variable** font and that is the point: `fontique` reads its
+`wght` axis and sets the weight from CSS, so one file per slant covers every
+weight the base stylesheet asks for, statics for none of them. Charis SIL is a
+fallback reached for a rare glyph, so it carries no bold — a synthesised one is
+fine there.
+
+The faces are registered per document through `Resource::Font`, not through
+`DocumentConfig::font_ctx`. Supplying that field makes blitz skip registering
+its own list-bullet font, and that font is `pub(crate)` — a shared context costs
+`<li>` markers. Share one, and vendor a bullet font, only if this shows up in a
+profile.
+
+The system's fonts stay available as a last resort for glyphs none of the three
+carry. "Bundled only" is about ignoring the *book's* fonts, not about rendering
+tofu.
+
 Every book's `@font-face` is ignored. **Consequence: font de-obfuscation is code
 that never gets written.** Several books in the test library carry Adobe-obfuscated
 fonts (`enc#RC`); Omaread neither needs nor wants them.
@@ -327,6 +352,19 @@ Shared plumbing that had to move: all three views are paginated documents, so
 library's PageUp/PageDown called the *reading* page turn, which reads the open
 chapter's page count and so did nothing at all with no book open.
 
+*Fonts.* The three bundled families are in `assets/fonts/` and embedded in the
+binary; see §3 for what ships and why. Until now the reader asked for Literata
+and got whatever system serif fontconfig offered, so the measure, the
+justification and the hyphenation were all tuned against a face that was never
+going to ship.
+
+The switch is visible in the sweep: the 19 books in `~/Documents` went from
+**9859 pages to 10940** at the same window size — an 11% reflow, which is the
+proof that the bundled faces reach layout rather than merely registering. It
+also surfaced a real paginator bug (§9, row bands shorter than their lines);
+that is fixed, and the sweep is back to **0 panics, 0 breaks cutting an atom, 0
+stalls** across 786 chapters.
+
 Next: chrome — the invisible-chrome toggle, and the Omarchy theme template (§11).
 
 ## 9. Spike findings (verified, not assumed)
@@ -435,6 +473,31 @@ guard so a group starting at or above the page top is left alone, and a tiered
 snap: all rules, then the no-cut invariant alone, and only then a hard cut for a
 single atom genuinely taller than a page. Regression test:
 `a_group_spanning_many_pages_never_gets_cut`.
+
+**A table row band can be shorter than the line inside it.** Bands are derived
+from cell boxes (`<tr>` has none, §9 above), and table layout sizes a row from
+those boxes — but a line box can overflow its cell. Bundling Literata made lines
+29px where the fallback face gave 26px, and cells sized at 27px no longer held
+them. Every overflowing line then stuck out of its band as an atom the paginator
+could neither break at nor snap past, and a page ran out of legal breaks
+entirely: one hard cut through a line, in *The Well-Grounded Rubyist* ch.5.
+
+The fix is two steps, and both are needed:
+
+- **Absorb**, don't just drop. Every atom found inside a table is folded into
+  the row band it overlaps most, *growing* the band to cover it. The old rule
+  dropped only atoms already fully contained, which is the same thing whenever
+  the geometry is exact and no help at all when it isn't. Content inside a table
+  but in no row — a `<caption>` — stays an atom of its own.
+- **Then separate.** Growing pushes a band's bottom past the next band's top,
+  and a run of those turns a table into one unbroken forbidden span: thirteen
+  chained bands across 1022px of a 900px page, which is a forced cut. The later
+  band yields, because the overlap is text from the earlier row hanging into the
+  next row's box and the break belongs *below* that text.
+
+Both steps are pure functions with unit tests (`absorb_into_bands`,
+`separate_bands`). This is the second time floating adjacency inside a table has
+cost a hard cut, and the second time the sweep found it rather than the eye.
 
 **rbook's href space is absolute and slash-prefixed.** `manifest_entry().href()`
 yields `/OEBPS/ch04.html`. `read_resource_*` accepts either that form or a path
