@@ -77,8 +77,8 @@ pub fn html(
 <html><body>
 <div class="bar">
   <div class="brand">
-    <span class="title">Library</span>
-    <span class="meta">{heading} · sorted by {sort}</span>
+    <span class="title">Library ({heading})</span>
+    <span class="meta"> · sorted by {sort}</span>
   </div>
   {search}
 </div>
@@ -162,7 +162,7 @@ fn card(index: usize, b: &BookRow, with_cover: bool) -> String {
     // to depend on whether it had a cover — which made "which cards are on this
     // page" depend on which cards were given covers, which is circular, and the
     // grid rebuilt itself forever. The title is already under the card anyway.
-    let cover = match b.cover.is_some() && with_cover {
+    let cover = match b.has_cover && with_cover {
         true => format!(
             r#"<img class="cover" src="{COVER_ORIGIN}{hash}"/>"#,
             hash = escape(&b.hash)
@@ -442,7 +442,7 @@ mod tests {
             .map(|i| {
                 let mut r = row(&format!("Libro {i}"), "Autor");
                 r.hash = format!("h{i}");
-                r.cover = Some(vec![1, 2, 3]);
+                r.has_cover = true;
                 r
             })
             .collect();
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn a_card_is_the_same_box_with_or_without_a_cover() {
         let mut with = row("Con portada", "A");
-        with.cover = Some(vec![1]);
+        with.has_cover = true;
         let without = row("Sin portada", "N");
 
         let a = html(&[with], "", Sort::Recent, &[], None, 0..1);

@@ -571,6 +571,28 @@ pub fn text_layout(dom: &BaseDocument, id: usize) -> Option<&blitz_dom::node::Te
     }
 }
 
+/// An element's tag, lowercase.
+pub fn tag_of(dom: &BaseDocument, id: usize) -> Option<String> {
+    match &dom.get_node(id)?.data {
+        NodeData::Element(el) => Some(el.name.local.as_ref().to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// All the laid-out text under a node, as one string.
+pub fn text_of(dom: &BaseDocument, id: usize) -> String {
+    let mut out = String::new();
+    walk_elements(dom, id, &mut |_, el| {
+        if let Some(tl) = el.inline_layout_data.as_ref() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(tl.text.trim());
+        }
+    });
+    out.trim().to_string()
+}
+
 /// Rectangles covering a selection, in flow coordinates, as `(x0, y0, x1, y1)`.
 pub fn selection_rects(
     dom: &BaseDocument,

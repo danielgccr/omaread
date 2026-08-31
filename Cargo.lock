@@ -2264,6 +2264,7 @@ dependencies = [
  "blitz-traits",
  "fontique",
  "hyphenation",
+ "image",
  "kurbo 0.12.0",
  "parley",
  "peniko",

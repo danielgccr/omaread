@@ -96,6 +96,23 @@ fn ground_band(
     );
 }
 
+/// Blank the frame to the page ground.
+///
+/// A column painted with `first` resets the scene itself, but only at x = 0 —
+/// during a page turn every column is offset, so the reset has to happen here
+/// instead.
+pub fn clear(scene: &mut impl PaintScene, ground: Color, frame: &Frame) {
+    PaintScene::reset(scene);
+    PaintScene::fill(
+        scene,
+        Fill::NonZero,
+        Affine::IDENTITY,
+        ground,
+        None,
+        &Rect::new(0.0, 0.0, frame.width as f64, frame.height as f64),
+    );
+}
+
 /// Paint one page of a flow: the slice `[top, top + extent)`, with everything
 /// above and below masked back to the page ground.
 ///
@@ -174,6 +191,27 @@ pub fn outline(
         None,
         &r,
     );
+}
+
+/// Fill a rounded rectangle given in CSS pixels — the wash under the pointer.
+///
+/// Painted *over* the surface, translucent, for the same reason the outline is
+/// painted at all: a `:hover` class would mean rebuilding the document on every
+/// mouse move. The HUD's own ground is opaque, so a wash beneath it would not
+/// show at all.
+pub fn wash(scene: &mut impl PaintScene, rect: (f32, f32, f32, f32), color: Color, scale: f64) {
+    let (x, y, w, h) = rect;
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let r = kurbo::RoundedRect::new(
+        x as f64 * scale,
+        y as f64 * scale,
+        (x + w) as f64 * scale,
+        (y + h) as f64 * scale,
+        6.0 * scale,
+    );
+    PaintScene::fill(scene, Fill::NonZero, Affine::IDENTITY, color, None, &r);
 }
 
 /// Which glyph a HUD control wants. The bundled faces carry no symbol glyphs

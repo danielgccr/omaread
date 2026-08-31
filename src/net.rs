@@ -54,10 +54,13 @@ impl<D: Send + Sync + 'static> NetProvider<D> for BookNetProvider<D> {
 
 /// Serves cover images to the library view straight out of SQLite. Same
 /// hermetic rule as the book provider: nothing but our own origin resolves.
-// ponytail: covers are served at whatever size the publisher shipped, so blitz
-// decodes a full-size JPEG per card and a full grid rebuild costs 1.8s for 361
-// books — about 1.5s of it decoding. Downscale at import (and cache the decoded
-// RGBA, §4's in-memory LRU) when that stops being only a rebuild cost.
+/// Covers are shrunk to card size on the way in; anything stored before that
+/// rule existed is shrunk the first time it is shown and written back, so the
+/// cost is paid once per book rather than on every rebuild.
+/// Above this, a stored cover is bigger than a card can use. A shrunk one lands
+/// well under it, so the check costs nothing after the first visit.
+const SHRINK_OVER: usize = 80 * 1024;
+
 pub struct CoverProvider<D> {
     db: Arc<Mutex<Db>>,
     callback: SharedCallback<D>,
@@ -77,10 +80,18 @@ impl<D: Send + Sync + 'static> NetProvider<D> for CoverProvider<D> {
             return;
         }
         let hash = url.path().trim_start_matches('/');
-        let bytes = self.db.lock().ok().and_then(|d| d.cover(hash));
-        if let Some(bytes) = bytes {
-            handler.bytes(doc_id, Bytes::from(bytes), self.callback.clone());
-        }
+        let Some(bytes) = self.db.lock().ok().and_then(|d| d.cover(hash)) else { return };
+        let bytes = match bytes.len() > SHRINK_OVER {
+            false => bytes,
+            true => {
+                let small = crate::library::shrink_cover(bytes);
+                if let Ok(db) = self.db.lock() {
+                    let _ = db.set_cover(hash, &small);
+                }
+                small
+            }
+        };
+        handler.bytes(doc_id, Bytes::from(bytes), self.callback.clone());
     }
 }
 
@@ -100,7 +111,7 @@ fn log_blocked(url: &blitz_traits::net::Url) {
 ///
 /// The result keeps its leading slash: rbook treats a slashless path as relative
 /// to the OPF directory, which silently doubles the prefix (see `book.rs`).
-fn in_archive_path(path: &str) -> Option<String> {
+pub fn in_archive_path(path: &str) -> Option<String> {
     let decoded = percent_decode(path);
     let mut out: Vec<&str> = Vec::new();
 

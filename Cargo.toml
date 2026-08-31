@@ -11,6 +11,9 @@ blitz-html = "0.2.0"
 blitz-paint = "0.2.1"
 blitz-traits = "0.2.0"
 hyphenation = { version = "0.8.4", features = ["embed_all"] }
+# Already in the tree, pinned by blitz-dom. Named directly to shrink covers:
+# a card is 225px wide and publishers ship 2100px, which is 4.5MB of RGBA each.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 kurbo = "0.12"
 # Pinned by blitz-dom; named directly for text selection (Cursor/Selection).
 parley = "0.6"

@@ -130,7 +130,7 @@ pub fn run(args: &[String]) -> i32 {
 
             let (_, fg, subtle, panel) = theme.chrome_colors();
             chapter::layout_document(
-                hud::html(&book.title, &readout, cols as usize, false, h as f32),
+                hud::html(&book.title, &readout, cols as usize, false, h as f32, None),
                 hud::stylesheet(fg, subtle, panel),
                 None,
                 // The HUD spans the window, not a column.

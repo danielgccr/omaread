@@ -41,7 +41,11 @@ pub struct BookRow {
     pub path: String,
     pub title: String,
     pub author: String,
+    /// The image itself. Only filled on the way *in* — a listing carries
+    /// `has_cover` instead, because 358 JPEGs is 97MB of RAM to decide which
+    /// cards get an `<img>`.
     pub cover: Option<Vec<u8>>,
+    pub has_cover: bool,
     pub managed: bool,
     pub missing: bool,
     pub started: bool,
@@ -254,7 +258,7 @@ impl Db {
         let mut args = vec![like];
         args.extend(fts);
         let sql = format!(
-            "SELECT file_hash, file_path, title, author, cover, managed, missing,
+            "SELECT file_hash, file_path, title, author, cover IS NOT NULL, managed, missing,
                     last_cfi IS NOT NULL
              FROM books
              WHERE (?1 = '%%' OR title LIKE ?1 ESCAPE '\\' OR author LIKE ?1 ESCAPE '\\'{full_text})
@@ -268,7 +272,8 @@ impl Db {
                     path: r.get(1)?,
                     title: r.get(2)?,
                     author: r.get(3)?,
-                    cover: r.get(4)?,
+                    cover: None,
+                    has_cover: r.get::<_, i64>(4)? != 0,
                     managed: r.get::<_, i64>(5)? != 0,
                     missing: r.get::<_, i64>(6)? != 0,
                     started: r.get::<_, i64>(7)? != 0,
@@ -283,7 +288,7 @@ impl Db {
 
     fn books_tagged(&self, prefix: &str, order: &str) -> Result<Vec<BookRow>, String> {
         let sql = format!(
-            "SELECT file_hash, file_path, title, author, cover, managed, missing,
+            "SELECT file_hash, file_path, title, author, cover IS NOT NULL, managed, missing,
                     last_cfi IS NOT NULL
              FROM books
              WHERE file_hash IN (SELECT file_hash FROM tags WHERE tag LIKE ?1)
@@ -297,7 +302,8 @@ impl Db {
                     path: r.get(1)?,
                     title: r.get(2)?,
                     author: r.get(3)?,
-                    cover: r.get(4)?,
+                    cover: None,
+                    has_cover: r.get::<_, i64>(4)? != 0,
                     managed: r.get::<_, i64>(5)? != 0,
                     missing: r.get::<_, i64>(6)? != 0,
                     started: r.get::<_, i64>(7)? != 0,
@@ -622,6 +628,15 @@ impl Db {
         out.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
         out.truncate(limit);
         out
+    }
+
+    /// Replace a stored cover — used once per book, when the full-size image the
+    /// publisher shipped is shrunk to what a card can show.
+    pub fn set_cover(&self, hash: &str, cover: &[u8]) -> Result<(), String> {
+        self.conn
+            .execute("UPDATE books SET cover = ?2 WHERE file_hash = ?1", params![hash, cover])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     pub fn cover(&self, hash: &str) -> Option<Vec<u8>> {

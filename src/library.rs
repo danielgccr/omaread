@@ -89,6 +89,33 @@ pub fn is_epub(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
 }
 
+/// Widest a stored cover needs to be: twice the 225px card, so a HiDPI screen
+/// still has pixels to spare.
+///
+/// Publishers ship 2100×3000 — 25MB of RGBA that blitz decodes to paint a
+/// thumbnail. Shrinking on the way in took the library's covers from 97MB to a
+/// tenth of that on disk, and the decoded page from ~240MB to ~35MB.
+pub const COVER_MAX_W: u32 = 450;
+
+/// Shrink a cover to `COVER_MAX_W`, or hand it back untouched.
+///
+/// ponytail: re-encoded as JPEG at quality 82, so a cover with transparency is
+/// flattened onto white. Covers are photographs of paper; keep PNG for PNG if a
+/// real one ever looks wrong.
+pub fn shrink_cover(bytes: Vec<u8>) -> Vec<u8> {
+    let Ok(img) = image::load_from_memory(&bytes) else { return bytes };
+    if img.width() <= COVER_MAX_W {
+        return bytes;
+    }
+    let small = img.resize(COVER_MAX_W, u32::MAX, image::imageops::FilterType::Triangle);
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 82);
+    match enc.encode_image(&image::DynamicImage::ImageRgb8(small.to_rgb8())) {
+        Ok(()) => out.into_inner(),
+        Err(_) => bytes,
+    }
+}
+
 /// Read title, author and cover out of a book.
 pub fn describe(path: &Path, hash: String) -> Result<BookRow, String> {
     let epub = Epub::open(path).map_err(|e| format!("open: {e}"))?;
@@ -114,13 +141,15 @@ pub fn describe(path: &Path, hash: String) -> Result<BookRow, String> {
     let cover = epub
         .manifest()
         .cover_image()
-        .and_then(|entry| epub.read_resource_bytes(entry.href()).ok());
+        .and_then(|entry| epub.read_resource_bytes(entry.href()).ok())
+        .map(shrink_cover);
 
     Ok(BookRow {
         hash,
         path: path.to_string_lossy().into_owned(),
         title,
         author,
+        has_cover: cover.is_some(),
         cover,
         managed: path.starts_with(library_dir()),
         missing: false,

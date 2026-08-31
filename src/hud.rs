@@ -21,6 +21,9 @@ pub fn html(
     columns: usize,
     on_highlight: bool,
     window_height: f32,
+    // Where a followed link was followed *from*, already worded. `None` when
+    // there is nowhere to go back to, and then there is no button either.
+    back: Option<&str>,
 ) -> String {
     // Top bar occupies [INSET, INSET + BAR]; this drops the bottom one to
     // [H - INSET - BAR, H - INSET].
@@ -47,11 +50,50 @@ pub fn html(
 <div class="hud" style="margin-top: {push}px">
   <span class="btn" data-hud="library"><span class="ico" data-icon="back"></span><span class="lbl">Library</span></span>
   <span class="title">{title}</span>
-  <span class="btn" data-hud="readout">{readout}</span>
+  {back}<span class="btn" data-hud="readout">{readout}</span>
 </div>
 </body></html>"#,
         title = escape(title),
         readout = escape(readout),
+        back = match back {
+            Some(label) => {
+                format!(r#"<span class="btn" data-hud="back">{}</span>"#, escape(label))
+            }
+            None => String::new(),
+        },
+    )
+}
+
+/// A footnote or a bibliography entry, shown where you are rather than by
+/// sending you to the page it lives on and leaving you to find your way back.
+pub fn note_html(text: &str) -> String {
+    format!(r#"<!DOCTYPE html><html><body><div class="note">{}</div></body></html>"#, escape(text))
+}
+
+/// The popup's own sheet. Same overlay path as the bars: a document painted
+/// over the page (CONTEXT.md §9), not a second window.
+pub fn note_stylesheet(fg: &str, subtle: &str, panel: &str) -> String {
+    format!(
+        r#"
+html {{
+  box-sizing: border-box;
+  font-family: "Literata", "Charis SIL", serif;
+  background: transparent;
+  color: {fg};
+}}
+html *, html *::before, html *::after {{ box-sizing: inherit; }}
+html body {{ margin: 0; padding: 0 6vw; background: transparent; }}
+html .note {{
+  margin-top: 26vh;
+  padding: 22px 26px;
+  border-radius: 12px;
+  border: 1px solid {subtle};
+  background: {panel};
+  font-size: 17px;
+  line-height: 1.5;
+  text-align: left;
+}}
+"#
     )
 }
 
@@ -125,7 +167,7 @@ mod tests {
     /// The bars are placed by computed margins, so the arithmetic is the layout.
     #[test]
     fn the_bars_sit_at_the_head_and_foot_of_the_window() {
-        let out = html("A Book", "42%", 1, false, 1000.0);
+        let out = html("A Book", "42%", 1, false, 1000.0, Some("Back to page 7"));
         let push = 1000.0 - 2.0 * INSET - 2.0 * BAR;
         assert!(out.contains(&format!("margin-top: {push}px")), "{out}");
         assert!(out.contains("42%"));
@@ -134,7 +176,7 @@ mod tests {
     /// A window shorter than the bars must not produce a negative margin.
     #[test]
     fn a_tiny_window_does_not_push_the_bar_off_the_top() {
-        let out = html("A Book", "0%", 1, false, 10.0);
+        let out = html("A Book", "0%", 1, false, 10.0, Some("Back to page 7"));
         assert!(out.contains("margin-top: 0px"), "{out}");
     }
 
@@ -142,7 +184,7 @@ mod tests {
     /// readout is ours but goes through the same escaping.
     #[test]
     fn the_title_cannot_inject_markup() {
-        let out = html(r#"<script>x</script>"#, "<b>", 2, false, 800.0);
+        let out = html(r#"<script>x</script>"#, "<b>", 2, false, 800.0, Some("Back to page 7"));
         assert!(!out.contains("<script"), "{out}");
         assert!(out.contains("&lt;script&gt;"));
         assert!(!out.contains("<b>"));
@@ -152,7 +194,7 @@ mod tests {
     /// title has to be the bold one.
     #[test]
     fn the_controls_are_click_targets_and_the_title_is_bold() {
-        let out = html("A Book", "page 8 of 19", 2, false, 900.0);
+        let out = html("A Book", "page 8 of 19", 2, false, 900.0, Some("Back to page 7"));
         for what in [
             "bookmark", "contents", "highlight", "smaller", "bigger", "columns", "readout",
             "library",
@@ -169,11 +211,11 @@ mod tests {
     /// Once the pointer is inside a highlight, the useful offer is removing it.
     #[test]
     fn the_highlight_control_becomes_a_remove_control() {
-        let plain = html("A Book", "5%", 1, false, 900.0);
+        let plain = html("A Book", "5%", 1, false, 900.0, Some("Back to page 7"));
         assert!(plain.contains(r#"data-hud="highlight""#));
         assert!(!plain.contains("unhighlight"));
 
-        let inside = html("A Book", "5%", 1, true, 900.0);
+        let inside = html("A Book", "5%", 1, true, 900.0, Some("Back to page 7"));
         assert!(inside.contains(r#"data-hud="unhighlight""#), "{inside}");
         assert!(inside.contains(">Remove<"));
         // The icon slot stays, whichever way the button reads.
@@ -183,7 +225,7 @@ mod tests {
     /// Every icon slot the window paints into has to exist in the markup.
     #[test]
     fn the_icon_slots_are_there_for_the_window_to_paint_into() {
-        let out = html("A Book", "5%", 2, false, 900.0);
+        let out = html("A Book", "5%", 2, false, 900.0, Some("Back to page 7"));
         for icon in ["bookmark", "contents", "highlight", "back"] {
             assert!(out.contains(&format!(r#"data-icon="{icon}""#)), "missing {icon}: {out}");
         }
@@ -196,7 +238,7 @@ mod tests {
     /// HUD is rebuilt on every page turn, so that was a stream of it.
     #[test]
     fn the_document_declares_a_doctype() {
-        assert!(html("A", "1%", 1, false, 900.0).starts_with("<!DOCTYPE html>"));
+        assert!(html("A", "1%", 1, false, 900.0, Some("Back to page 7")).starts_with("<!DOCTYPE html>"));
         assert!(crate::toc::html(&[], "Contents", "t", 0, 0).starts_with("<!DOCTYPE html>"));
         assert!(
             crate::grid::html(&[], "", crate::db::Sort::Recent, &[], None, 0..0)

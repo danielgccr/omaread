@@ -47,7 +47,23 @@ const SELECTION: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x40);
 /// The library's selected card, outlined rather than filled so the cover shows.
 pub const CARD_OUTLINE: Color = Color::from_rgb8(0x0a, 0x84, 0xff);
 /// The card under the pointer. Light enough to read the cover through.
-const CARD_HOVER: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x24);
+const HOVER: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x24);
+/// The HUD control under the pointer. Heavier than the card wash: it sits on a
+/// flat panel rather than a photograph, so a cover-safe tint reads as nothing.
+const HUD_HOVER: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x3d);
+
+#[derive(Clone, Copy)]
+struct Slide {
+    from: usize,
+    forward: bool,
+    at: Instant,
+}
+
+/// How long a page takes to slide out of the way. Long enough to see which way
+/// the page went, short enough that holding the key still turns pages quickly.
+const SLIDE: Duration = Duration::from_millis(160);
+/// Wake-up interval while a page is sliding — about 120fps, no busy loop.
+const FRAME: Duration = Duration::from_millis(8);
 
 /// How long the reading HUD lingers after the pointer stops moving.
 const HUD_LINGER: Duration = Duration::from_millis(2200);
@@ -111,6 +127,36 @@ mod tests {
         }
     }
 
+    /// A note is shown where you are; a section is somewhere to go.
+    #[test]
+    fn a_short_block_is_a_note_and_a_section_is_a_place() {
+        assert!(super::is_note("p", "1. Ibíd., p. 233."), "a bibliography entry");
+        assert!(super::is_note("aside", "A footnote, as EPUB 3 would write one."));
+        assert!(super::is_note("li", "Postman, N., Amusing Ourselves to Death, 1985."));
+
+        // A heading is where a section starts: that is a page to turn to.
+        assert!(!super::is_note("h2", "Capítulo 4"));
+        assert!(!super::is_note("section", "Capítulo 4"));
+        // So is a whole chapter that happens to sit in a <div>.
+        assert!(!super::is_note("div", &"palabra ".repeat(200)));
+        // And an empty target says nothing worth a popup.
+        assert!(!super::is_note("p", "   "));
+    }
+
+    /// The page you left goes the way you turned, and the one arriving comes
+    /// from the other side. Backwards is the mirror, or the gesture lies.
+    #[test]
+    fn a_turn_slides_the_way_it_was_turned() {
+        let w = 900.0;
+        assert_eq!(super::slide_offsets(true, 0.0, w), (0.0, w), "the new page waits offstage right");
+        assert_eq!(super::slide_offsets(true, 1.0, w), (-w, 0.0), "and lands where the old one was");
+        assert_eq!(super::slide_offsets(false, 0.0, w), (0.0, -w), "turning back, it waits at the left");
+        assert_eq!(super::slide_offsets(false, 1.0, w), (w, 0.0));
+        // Halfway, the two are adjacent: no gap, no overlap.
+        let (out, into) = super::slide_offsets(true, 0.5, w);
+        assert!((into - out - w).abs() < 0.01, "{out} and {into} must abut");
+    }
+
     #[test]
     fn a_taller_window_reveals_cards_the_covers_did_not_cover() {
         use crate::db::BookRow;
@@ -120,7 +166,7 @@ mod tests {
                 hash: format!("h{i}"),
                 title: format!("Libro {i}"),
                 author: "Autor".into(),
-                cover: Some(vec![0]),
+                has_cover: true,
                 ..Default::default()
             })
             .collect();
@@ -169,7 +215,7 @@ mod tests {
 
         let (w, h) = (1200u32, 900u32);
         let doc = crate::chapter::layout_document(
-            crate::hud::html("Un libro", "page 8 of 19", 2, false, h as f32),
+            crate::hud::html("Un libro", "page 8 of 19", 2, false, h as f32, Some("Back to page 7")),
             crate::hud::stylesheet("#111", "#888", "#eee"),
             None,
             crate::chapter::viewport(w, h, 1.0, false),
@@ -227,6 +273,16 @@ pub fn parse_hex(s: &str) -> Color {
 }
 
 fn main() {
+    // wgpu enumerates every backend at instance creation, and enumerating the
+    // GL one dlopens Mesa: libLLVM and libgallium, 108MB of resident memory for
+    // a path vello cannot use anyway (it needs compute shaders). Vulkan keeps
+    // both the hardware driver and lavapipe, the software fallback.
+    //
+    // Before any thread exists, and never over a choice the user has made.
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        unsafe { std::env::set_var("WGPU_BACKEND", "vulkan") };
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--check") {
         std::process::exit(check::run(&args[1..]));
@@ -343,6 +399,23 @@ struct App {
     lib_page: usize,
     /// The library card under the pointer, for hover feedback.
     hover_card: Option<usize>,
+    /// The `data-hud` control under the pointer, same idea.
+    hover_hud: Option<String>,
+    /// Where the reader was before following a link or a contents entry, so the
+    /// bar can offer them the way back: the chapter, its page, and how to say so.
+    ///
+    /// The wording is captured on the way out, while that position is still the
+    /// current one — it is the only moment the whole-book page number or the
+    /// percentage can be worked out exactly.
+    back: Option<(usize, usize, String)>,
+    /// A footnote or reference on show over the page.
+    popup: Option<Chapter>,
+    /// A page turn in flight: the page being left, and which way it went.
+    ///
+    /// ponytail: within one chapter only. Turning across a chapter boundary
+    /// loads a different document and the outgoing page is already gone, so
+    /// that turn cuts. Keep both documents alive if it ever grates.
+    slide: Option<Slide>,
     /// A tag being typed for the selected book. Tagging borrows the search box.
     tagging: Option<String>,
     /// The contents list. Rebuilt on every open and on every selection move.
@@ -433,6 +506,10 @@ impl App {
             lib_covers: 0..0,
             lib_page: 0,
             hover_card: None,
+            hover_hud: None,
+            slide: None,
+            back: None,
+            popup: None,
             tagging: None,
             toc_doc: None,
             hud_doc: None,
@@ -693,14 +770,19 @@ impl App {
         let cols = self.effective_columns();
         let height = self.size.1 as f32 / self.scale;
         let on_mark = self.sel_mark.is_some();
-        let key =
-            format!("{readout}|{cols}|{on_mark}|{height}|{:?}|{}", self.style.theme, book.title);
+        let back = self.back.as_ref().map(|(_, _, label)| label.clone());
+        let key = format!(
+            "{readout}|{cols}|{on_mark}|{height}|{:?}|{}|{:?}",
+            self.style.theme,
+            book.title,
+            back,
+        );
         if key == self.hud_key && self.hud_doc.is_some() {
             return;
         }
 
         let (_, fg, subtle, panel) = self.chrome();
-        let html = hud::html(&book.title, &readout, cols, on_mark, height);
+        let html = hud::html(&book.title, &readout, cols, on_mark, height, back.as_deref());
         let ua = hud::stylesheet(&fg, &subtle, &panel);
         // The HUD spans the window; only the page is laid out at column width.
         let vp = chapter::viewport(
@@ -957,6 +1039,168 @@ impl App {
         Some((node, fx - ox, fy - oy))
     }
 
+    /// Follow whatever `<a>` is under the pointer. Returns true when it dealt
+    /// with the press, so the page does not also start a selection.
+    ///
+    /// A footnote or a bibliography entry opens where you are; anything longer
+    /// is a place, so go there — and remember where you were.
+    fn link_action(&mut self) -> bool {
+        if self.view != View::Reading {
+            return false;
+        }
+        // A popup takes the next click, whatever it lands on.
+        if self.popup.take().is_some() {
+            self.request_redraw();
+            return true;
+        }
+        let href = {
+            let Some(ch) = self.chapter.as_ref() else { return false };
+            let (fx, fy) = self.pointer_in_flow();
+            let Some(hit) = ch.doc.hit(fx, fy) else { return false };
+            match ancestor_attr(ch.dom(), hit.node_id, "href") {
+                Some(h) => h,
+                None => return false,
+            }
+        };
+        // Off-book links are §3's confirm-then-xdg-open, which is not built:
+        // better to do nothing than to open a browser without asking.
+        if href.contains("://") || href.starts_with("mailto:") {
+            eprintln!("omaread: external link {href} (not opened)");
+            return true;
+        }
+        let Some((spine, frag)) = self.resolve_href(&href) else { return false };
+
+        if let Some(text) = self.note_at(spine, frag.as_deref()) {
+            self.open_note(&text);
+            return true;
+        }
+
+        self.back = Some((self.index, self.page, self.here_label()));
+        self.hud_doc = None;
+        self.go_to(spine, frag.as_deref());
+        true
+    }
+
+    /// Split a book-relative href into the spine item it names and its fragment.
+    fn resolve_href(&self, href: &str) -> Option<(usize, Option<String>)> {
+        let (path, frag) = match href.split_once('#') {
+            Some((p, f)) => (p, Some(f.to_string())),
+            None => (href, None),
+        };
+        let book = self.book.as_ref()?;
+        if path.is_empty() {
+            return Some((self.index, frag));
+        }
+        // Relative to the chapter it was found in, and normalised the same way
+        // the resource provider normalises: same input, same answer.
+        let here = book.chapter_href(self.index).unwrap_or_default();
+        let dir = here.rsplit_once('/').map_or("", |(d, _)| d);
+        let target = net::in_archive_path(&format!("{dir}/{path}"))?;
+        (0..book.chapter_count())
+            .find(|&i| {
+                book.chapter_href(i).and_then(net::in_archive_path).as_deref() == Some(&target)
+            })
+            .map(|i| (i, frag))
+    }
+
+    /// The text of a link target, when the target is a note rather than a place.
+    ///
+    /// A footnote, an endnote and a bibliography entry are all a short block of
+    /// text; a section is a heading, a wrapper, or pages of prose. That is the
+    /// whole test — the `epub:type="noteref"` a spec would use is carried by 4
+    /// books of 60 in the real library, so it cannot be the rule.
+    fn note_at(&self, spine: usize, frag: Option<&str>) -> Option<String> {
+        let frag = frag?;
+        let owned;
+        let ch = match spine == self.index {
+            true => self.chapter.as_ref()?,
+            // Notes usually live in their own spine item, so lay it out — a
+            // chapter is 20–40ms and this is a click, not a frame.
+            false => {
+                let book = self.book.clone()?;
+                let cb = self.callback();
+                owned = chapter::load(
+                    &book,
+                    spine,
+                    &self.style,
+                    self.viewport(),
+                    self.page_height(),
+                    self.hyphenator.as_ref(),
+                    cb,
+                )
+                .ok()?;
+                &owned
+            }
+        };
+        let node = find_by_attr(ch.dom(), 0, "id", frag)?;
+        let tag = chapter::tag_of(ch.dom(), node)?;
+        let text = chapter::text_of(ch.dom(), node);
+        is_note(&tag, &text).then_some(text)
+    }
+
+    fn open_note(&mut self, text: &str) {
+        let (_, fg, subtle, panel) = self.chrome();
+        let vp = chapter::viewport(
+            self.size.0,
+            self.size.1,
+            self.scale,
+            self.style.theme == Theme::Night,
+        );
+        self.popup = chapter::layout_document(
+            hud::note_html(text),
+            hud::note_stylesheet(&fg, &subtle, &panel),
+            None,
+            vp,
+            self.page_height(),
+        );
+        self.request_redraw();
+    }
+
+    /// Go to a spine item, landing on a fragment's page when there is one.
+    fn go_to(&mut self, spine: usize, frag: Option<&str>) {
+        if spine != self.index {
+            self.load_chapter(spine);
+        }
+        self.page = match frag
+            .and_then(|f| {
+                let ch = self.chapter.as_ref()?;
+                let node = find_by_attr(ch.dom(), 0, "id", f)?;
+                Some(ch.pages.page_containing(chapter::node_top(ch.dom(), node)?))
+            }) {
+            Some(page) => page,
+            None if spine != self.index => 0,
+            None => self.page,
+        };
+        self.resume_page = self.page;
+        self.save_position();
+        self.request_redraw();
+    }
+
+    /// Back to where the last link was followed from.
+    fn go_back(&mut self) {
+        let Some((spine, page, _)) = self.back.take() else { return };
+        if spine != self.index {
+            self.load_chapter(spine);
+        }
+        self.page = page.min(self.page_count().saturating_sub(1));
+        self.resume_page = self.page;
+        self.hud_doc = None;
+        self.save_position();
+        self.request_redraw();
+    }
+
+    /// Where the reader is, worded for the way-back button. Always about the
+    /// whole book: a chapter page number beside a whole-book percentage reads as
+    /// a contradiction — "back to page 5" from 32% of the way in.
+    fn here_label(&self) -> String {
+        match self.measured_pages() {
+            Some(_) => format!("Back to page {}", self.book_page().0),
+            // Not measured, so there is no honest page number for the book —
+            // the readout says a percentage here too.
+            None => format!("Back to {}%", (self.progress() * 100.0).round() as u8),
+        }
+    }
+
     /// What the foot of the page says.
     fn readout(&self) -> String {
         match self.show_page {
@@ -1098,21 +1342,22 @@ impl App {
 
     /// A control in the HUD under the pointer, if any. Returns true when it
     /// handled the click, so the page does not also start a selection.
-    fn hud_action(&mut self) -> bool {
+    /// The control under the pointer, by its `data-hud` name.
+    ///
+    /// The HUD is laid out at window size and painted unscrolled, so screen CSS
+    /// pixels are its own coordinates.
+    fn hud_under_pointer(&self) -> Option<String> {
         if !self.hud_shown || self.view != View::Reading {
-            return false;
+            return None;
         }
-        // The HUD is laid out at window size and painted unscrolled, so screen
-        // CSS pixels are its own coordinates.
-        let what = {
-            let Some(hud) = &self.hud_doc else { return false };
-            let (x, y) = (self.cursor.0 / self.scale, self.cursor.1 / self.scale);
-            let Some(hit) = hud.doc.hit(x, y) else { return false };
-            match ancestor_attr(hud.dom(), hit.node_id, "data-hud") {
-                Some(what) => what,
-                None => return false,
-            }
-        };
+        let hud = self.hud_doc.as_ref()?;
+        let (x, y) = (self.cursor.0 / self.scale, self.cursor.1 / self.scale);
+        let hit = hud.doc.hit(x, y)?;
+        ancestor_attr(hud.dom(), hit.node_id, "data-hud")
+    }
+
+    fn hud_action(&mut self) -> bool {
+        let Some(what) = self.hud_under_pointer() else { return false };
 
         match what.as_str() {
             "bookmark" => self.toggle_bookmark(),
@@ -1120,6 +1365,7 @@ impl App {
                 self.toc_mode = TocMode::Contents;
                 self.open_toc();
             }
+            "back" => self.go_back(),
             "highlight" => self.highlight_selection(),
             "unhighlight" => self.remove_selected_mark(),
             "library" => {
@@ -1204,6 +1450,16 @@ impl App {
             w.set_title("Omaread");
         }
         self.reload_rows();
+        // `page` is one field for all three views, so coming back from page 47
+        // of a book landed on page 47 of the shelf. The shelf starts at the top,
+        // on the book just closed — which has usually moved to the front of a
+        // Recent sort, so the old index pointed at somebody else.
+        self.selected = self
+            .rows
+            .iter()
+            .position(|r| r.hash == self.hash)
+            .unwrap_or(0);
+        self.page = 0;
         self.view = View::Library;
         self.request_redraw();
     }
@@ -1351,6 +1607,10 @@ impl App {
     /// send every entry to page 1.
     fn open_toc_entry(&mut self, i: usize) {
         let Some(entry) = self.book.as_ref().and_then(|b| b.toc.get(i).cloned()) else { return };
+        if self.chapter.is_some() {
+            self.back = Some((self.index, self.resume_page, self.here_label()));
+            self.hud_doc = None;
+        }
         self.view = View::Reading;
         if entry.spine == self.index && self.chapter.is_some() {
             self.page = 0;
@@ -1596,10 +1856,12 @@ impl App {
     /// Turn one page, crossing chapter boundaries in either direction.
     fn turn(&mut self, forward: bool) {
         let step = self.effective_columns();
+        let was = self.page;
         if forward {
             let last = self.page_count().saturating_sub(1);
             if self.page + step <= last {
                 self.page += step;
+                self.slide = Some(Slide { from: was, forward, at: Instant::now() });
             } else if self.index + 1 < self.chapter_count() {
                 self.load_chapter(self.index + 1);
             } else {
@@ -1607,6 +1869,7 @@ impl App {
             }
         } else if self.page >= step {
             self.page -= step;
+            self.slide = Some(Slide { from: was, forward, at: Instant::now() });
         } else if self.index > 0 {
             self.load_chapter_at(self.index - 1, true);
         } else {
@@ -1650,6 +1913,8 @@ impl App {
     }
 
     fn relayout(&mut self) {
+        // Laid out for the old window; it comes back on the next click.
+        self.popup = None;
         if self.view != View::Reading {
             let vp = self.viewport();
             let ph = self.page_height();
@@ -1739,7 +2004,17 @@ impl App {
             // A different page shows different cards, and only the cards on the
             // page carry covers.
             View::Library if self.lib_doc.is_none() || self.page != self.lib_page => {
-                self.build_library()
+                self.build_library();
+                // A selection on another page has nothing to outline here. Only
+                // possible under a sort that does not put the last-read book
+                // first, so the second build is rare.
+                match self.lib_doc.as_ref().and_then(|d| page_of_index(d, self.selected)) {
+                    Some(p) if p != self.page => {
+                        self.page = p;
+                        self.build_library();
+                    }
+                    _ => {}
+                }
             }
             View::Toc if self.toc_doc.is_none() => self.build_toc(),
             View::Reading if self.hud_shown => self.build_hud(),
@@ -1776,7 +2051,16 @@ impl App {
         // Disjoint field borrows: `render` takes the renderer mutably, the
         // closure needs the document mutably to set the page offset. That rules
         // out `doc_mut`, which borrows all of `self`.
-        let App { renderer, chapter, lib_doc, toc_doc, hud_doc, view, .. } = self;
+        let hover_hud = self.hover_hud.clone();
+        // How far through a page turn this frame is, eased out, and which page
+        // is on its way off. Only in the reading view: the library rebuilds its
+        // grid on a page turn to fetch that page's covers, so the outgoing page
+        // would lose its covers halfway across.
+        let slide = self.slide.filter(|_| self.view == View::Reading).and_then(|s| {
+            let t = s.at.elapsed().as_secs_f32() / SLIDE.as_secs_f32();
+            (t < 1.0).then(|| (s, 1.0 - (1.0 - t) * (1.0 - t)))
+        });
+        let App { renderer, chapter, lib_doc, toc_doc, hud_doc, popup, view, .. } = self;
         let hud = if showing_hud { hud_doc.as_mut() } else { None };
         let Some(ch) = (match view {
             View::Library => lib_doc.as_mut(),
@@ -1803,6 +2087,18 @@ impl App {
                 false => (0.0, 0.0),
             })
             .collect();
+        // The page being left, in the same flow: a turn within one chapter is
+        // two slices of one document, which is exactly what two columns are.
+        let outgoing: Vec<(f32, f32)> = match slide {
+            Some((s, _)) => (0..cols)
+                .map(|c| s.from + c)
+                .map(|p| match p < count {
+                    true => (ch.pages.top_of(p), ch.pages.extent_of(p)),
+                    false => (0.0, 0.0),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let doc = &mut ch.doc;
         let frame = paint::Frame {
             width: w,
@@ -1819,6 +2115,18 @@ impl App {
                 // Two columns are two pages of one flow side by side, not CSS
                 // multicol: the same document painted twice at two scroll
                 // offsets (CONTEXT.md §3).
+                if let Some((s, t)) = slide {
+                    // The old page walks off the way you turned, the new one
+                    // follows it in. Both are the same document at two offsets.
+                    let (out_x, in_x) = slide_offsets(s.forward, t, w as f32 / scale as f32);
+                    paint::clear(scene, ground, &frame);
+                    for (dx, pages) in [(out_x, &outgoing), (in_x, &slices)] {
+                        for (col, &(top, extent)) in pages.iter().enumerate() {
+                            let x = dx + col as f32 * col_w;
+                            paint::column(scene, doc, top, extent, x, col_w, &frame, ground, false);
+                        }
+                    }
+                } else {
                 for (col, &(top, extent)) in slices.iter().enumerate() {
                     let x = col as f32 * col_w;
                     if page + col >= count {
@@ -1831,6 +2139,7 @@ impl App {
                     paint::bands(scene, &highlights, HIGHLIGHT, top, extent, x, &frame);
                     paint::bands(scene, &selection, SELECTION, top, extent, x, &frame);
                 }
+                }
                 // A wash under the pointer, before the outline, so a card that
                 // is both hovered and selected still reads as selected.
                 if let Some((cx, cy, cw, chh)) = hovered_card {
@@ -1838,7 +2147,7 @@ impl App {
                     paint::bands(
                         scene,
                         &[(cx, cy, cx + cw, cy + chh)],
-                        CARD_HOVER,
+                        HOVER,
                         top,
                         extent,
                         0.0,
@@ -1856,10 +2165,21 @@ impl App {
                         scale,
                     );
                 }
+                if let Some(note) = popup.as_mut() {
+                    paint::overlay(scene, &mut note.doc, &frame);
+                }
                 if let Some(hud) = hud {
                     paint::overlay(scene, &mut hud.doc, &frame);
                     for &(icon, rect) in &icons {
                         paint::icon(scene, icon, rect, ink, scale);
+                    }
+                    // Over the bar, not under it: the bar's ground is opaque.
+                    if let Some(rect) = hover_hud
+                        .as_deref()
+                        .and_then(|w| find_by_attr(hud.dom(), 0, "data-hud", w))
+                        .and_then(|n| chapter::node_rect(hud.dom(), n))
+                    {
+                        paint::wash(scene, rect, HUD_HOVER, scale);
                     }
                 }
             }));
@@ -1871,6 +2191,11 @@ impl App {
     }
 
     fn on_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
+        // A note is read and dismissed; nothing else happens while it is up.
+        if self.popup.take().is_some() {
+            self.request_redraw();
+            return;
+        }
         match self.view {
             View::Library => self.library_key(event_loop, key),
             View::Reading => self.reading_key(event_loop, key),
@@ -2189,6 +2514,32 @@ impl App {
     }
 }
 
+/// Is this link target a note to read here, or a place to go to?
+///
+/// A footnote, an endnote and a bibliography entry are all a short block of
+/// text; a section is a heading, a wrapper, or pages of prose. That is the whole
+/// test — `epub:type="noteref"`, which a spec would key on, is carried by 4
+/// books of 60 sampled from the real library, so it cannot be the rule.
+///
+/// ponytail: a length cut-off. A very long footnote goes to its page like a
+/// section; key on `epub:type`/`role` as well if a real book gets it wrong.
+fn is_note(tag: &str, text: &str) -> bool {
+    const NOTE_MAX: usize = 700;
+    matches!(tag, "p" | "li" | "aside" | "div" | "span" | "td")
+        && !text.trim().is_empty()
+        && text.chars().count() <= NOTE_MAX
+}
+
+/// Where the outgoing and incoming pages sit, `t` of the way through a turn.
+///
+/// Turning forward walks the old page off to the left and brings the new one in
+/// from the right; turning back is the same motion mirrored, which is the whole
+/// point — the direction is the feedback.
+fn slide_offsets(forward: bool, t: f32, width: f32) -> (f32, f32) {
+    let dir = if forward { -1.0 } else { 1.0 };
+    (dir * t * width, (dir * t - dir) * width)
+}
+
 /// Which cards sit on `page`, from a laid-out grid.
 fn visible_cards(doc: &Chapter, page: usize) -> std::ops::Range<usize> {
     let top = doc.pages.top_of(page);
@@ -2289,7 +2640,7 @@ impl ApplicationHandler for App {
         match event {
             // The pointer left, so nothing is under it.
             WindowEvent::CursorLeft { .. } => {
-                if self.hover_card.take().is_some() {
+                if self.hover_card.take().is_some() | self.hover_hud.take().is_some() {
                     self.request_redraw();
                 }
             }
@@ -2321,6 +2672,11 @@ impl ApplicationHandler for App {
                         self.request_redraw();
                     }
                     self.poke_hud();
+                    let on = self.hud_under_pointer();
+                    if on != self.hover_hud {
+                        self.hover_hud = on;
+                        self.request_redraw();
+                    }
                 }
             }
 
@@ -2331,8 +2687,9 @@ impl ApplicationHandler for App {
                     // In the page, a press anchors a selection; in the library
                     // and the contents it opens whatever is under the pointer.
                     ElementState::Pressed if self.view == View::Reading => {
-                        // The HUD is on top of the page, so it gets the click.
-                        if !self.hud_action() {
+                        // The HUD is on top of the page, so it gets the click,
+                        // then a link, and only then does the page take it.
+                        if !self.hud_action() && !self.link_action() {
                             self.begin_selection();
                         }
                     }
@@ -2383,6 +2740,17 @@ impl ApplicationHandler for App {
                 return;
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            return;
+        }
+
+        // A page turn animates, so it drives the clock while it lasts.
+        if let Some(s) = self.slide {
+            if s.at.elapsed() >= SLIDE {
+                self.slide = None;
+            }
+            self.request_redraw();
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME));
             return;
         }
 
