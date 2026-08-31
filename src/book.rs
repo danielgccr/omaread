@@ -37,6 +37,8 @@ pub struct Book {
     /// Spine hrefs, in reading order, relative to the archive root.
     spine: Arc<Vec<String>>,
     pub title: String,
+    /// First `dc:creator`, empty when the book names none.
+    pub author: String,
     /// `dc:language`, used to pick hyphenation patterns.
     pub language: String,
     /// Flattened navigation, in document order. Never empty — see `read_toc`.
@@ -60,6 +62,13 @@ impl Book {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Untitled".into())
             });
+
+        let author = epub
+            .metadata()
+            .creators()
+            .next()
+            .map(|c| c.value().to_string())
+            .unwrap_or_default();
 
         let language = epub
             .metadata()
@@ -97,6 +106,7 @@ impl Book {
             inner: Arc::new(Mutex::new(epub)),
             spine: Arc::new(spine),
             title,
+            author,
             language,
             toc: Arc::new(toc),
             offsets: Arc::new(offsets),

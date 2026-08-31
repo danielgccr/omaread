@@ -82,7 +82,7 @@ html .hud {{
   padding: 7px 16px;
   border-radius: 9px;
   background: {panel};
-  font-size: 13px;
+  font-size: 18px;
 }}
 /* The title is the book, so it carries the weight. */
 html .title {{

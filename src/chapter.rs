@@ -293,6 +293,14 @@ pub fn load(
         html = crate::hyphen::mark_html(&html, h);
     }
 
+    // Most books open on a cover page that paints nothing: the cover image is
+    // wrapped in inline `<svg>`, which blitz does not parse into a tree (§9), so
+    // the reader's first page is blank paper. 27 of 40 books sampled from the
+    // real library do this. Give that page the title and the author instead.
+    if index == 0 && blank_cover(&raw) {
+        html = title_page(&book.title, &book.author);
+    }
+
     let base_url = base_url_for(&href);
     let ua = style.stylesheet();
     let provider: Arc<dyn NetProvider<Resource>> =
@@ -309,6 +317,36 @@ pub fn load(
             "the layout engine panicked on chapter {index} ({href}); skipping it"
         )),
     }
+}
+
+/// Does this spine item paint nothing at all? No text, and no `<img>` — a cover
+/// wrapped in inline `<svg>` reaches the engine as an empty tree.
+fn blank_cover(raw: &str) -> bool {
+    crate::search::text_of_html(raw).trim().is_empty()
+        && !raw.to_ascii_lowercase().contains("<img")
+}
+
+/// A cover page with nothing on it, replaced by the book's own name.
+///
+/// Inline styles rather than the reading stylesheet: `strip_publisher_css` only
+/// drops `<style>` and `<link>`, so an attribute is the one bit of CSS a
+/// chapter document can carry, and this page is the only one that wants any.
+fn title_page(title: &str, author: &str) -> String {
+    let by = match author.trim().is_empty() {
+        true => String::new(),
+        false => format!(
+            r#"<div style="font-size: 1.1em; margin-top: 2em;">{}</div>"#,
+            crate::grid::escape(author)
+        ),
+    };
+    format!(
+        r#"<!DOCTYPE html><html><body>
+<div style="margin-top: 30vh; text-align: center;">
+  <div style="font-size: 2em; font-weight: 600; line-height: 1.25;">{title}</div>
+  {by}
+</div></body></html>"#,
+        title = crate::grid::escape(title),
+    )
 }
 
 /// Parse, style and lay out one document. Returns `Err(())` if the engine panicked.
@@ -722,6 +760,27 @@ fn content_height(dom: &BaseDocument) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// A cover that reaches the engine as an empty tree gets the book's name; a
+    /// cover that actually paints must keep its image.
+    #[test]
+    fn only_a_cover_that_paints_nothing_is_replaced() {
+        let svg = r#"<html><body><svg viewBox="0 0 1 1"><image xlink:href="c.jpg"/></svg></body></html>"#;
+        let img = r#"<html><body><div><img src="cover.jpeg" alt="Cover"/></div></body></html>"#;
+        let prose = "<html><body><p>Llamadme Ismael.</p></body></html>";
+
+        assert!(super::blank_cover(svg));
+        assert!(!super::blank_cover(img), "a real cover image must survive");
+        assert!(!super::blank_cover(&img.to_uppercase().replace("XLINK", "xlink")));
+        assert!(!super::blank_cover(prose));
+
+        // Book metadata is untrusted; it must not inject into the page.
+        let page = super::title_page("<script>x</script>", "A & B");
+        assert!(!page.contains("<script"), "{page}");
+        assert!(page.contains("A &amp; B"));
+        // No author, no empty line where one would be.
+        assert!(!super::title_page("Solo", "  ").contains("margin-top: 2em"));
+    }
+
     use super::absorb_into_bands;
     use crate::paginate::{Atom, AtomKind};
 
