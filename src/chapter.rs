@@ -9,7 +9,7 @@ use crate::net::{BookNetProvider, ORIGIN};
 use crate::paginate::{self, Atom, AtomKind, Pages};
 use crate::style::{self, ReadingStyle};
 use blitz_dom::net::Resource;
-use blitz_dom::{BaseDocument, DocumentConfig};
+use blitz_dom::{BaseDocument, DocumentConfig, NodeData};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{Bytes, NetProvider, SharedCallback};
 use blitz_traits::shell::{ColorScheme, Viewport};
@@ -135,6 +135,24 @@ pub fn collect_atoms(dom: &BaseDocument) -> Vec<Atom> {
                     if table.is_some() { in_table.push(atom) } else { atoms.push(atom) }
                 }
                 _ => {}
+            }
+
+            // `data-atom` marks a box a break must not cut through — a library
+            // card, whose cover would otherwise land on one page and its title
+            // on the next. The box *is* the atom, so its contents are not
+            // walked: a clipped title lays out past the card it is clipped to,
+            // and those stray lines vetoed every break down the page.
+            let marked = el.attrs.iter().any(|a| &*a.name.local == "data-atom");
+            if marked && l.size.height > 0.0 {
+                let atom = Atom {
+                    top: abs_y,
+                    bottom: abs_y + l.size.height,
+                    group: id,
+                    kind: AtomKind::Block,
+                    keep_with_next: false,
+                };
+                if table.is_some() { in_table.push(atom) } else { atoms.push(atom) }
+                return;
             }
 
             if let Some(tl) = el.inline_layout_data.as_ref() {
@@ -331,6 +349,59 @@ fn build(
     .map_err(|_| ())
 }
 
+/// Pages per chapter for a whole book at one layout.
+///
+/// The only honest way to say "page 27 of 336": a page count depends on the
+/// layout, and one chapter's density does not predict the others — a spine with
+/// 131 items, many of them a paragraph long, made a single-chapter estimate swing
+/// between 76 and 342 pages for the same book.
+///
+/// Three seconds for that book, so callers cache the result.
+#[allow(clippy::too_many_arguments)]
+pub fn page_counts(
+    book: &Book,
+    style: &ReadingStyle,
+    hyphenator: Option<&Hyphenator_>,
+    width: u32,
+    height: u32,
+    scale: f32,
+    page_height: f32,
+) -> Vec<usize> {
+    let dark = style.theme == crate::style::Theme::Night;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    (0..book.chapter_count())
+        .map(|i| {
+            let cb: SharedCallback<Resource> = Arc::new(CollectCallback(tx.clone()));
+            let vp = viewport(width, height, scale, dark);
+            match load(book, i, style, vp, page_height, hyphenator, cb) {
+                Ok(mut ch) => {
+                    // Images change how much fits, and the in-zip provider
+                    // answers immediately, so take what arrived before counting.
+                    for resource in rx.try_iter() {
+                        let _ = catch_unwind(AssertUnwindSafe(|| ch.doc.load_resource(resource)));
+                    }
+                    relayout(&mut ch, viewport(width, height, scale, dark), page_height);
+                    ch.pages.count()
+                }
+                // A chapter the engine cannot lay out contributes no pages; it is
+                // skipped when reading, too.
+                Err(_) => 0,
+            }
+        })
+        .collect()
+}
+
+struct CollectCallback(std::sync::mpsc::Sender<Resource>);
+
+impl blitz_traits::net::NetCallback<Resource> for CollectCallback {
+    fn call(&self, _doc_id: usize, result: Result<Resource, Option<String>>) {
+        if let Ok(resource) = result {
+            let _ = self.0.send(resource);
+        }
+    }
+}
+
 /// Lay out an arbitrary document — used for the library view, which is HTML/CSS
 /// through the same pipeline as a book.
 pub fn layout_document(
@@ -365,6 +436,159 @@ pub fn node_top(dom: &BaseDocument, target: usize) -> Option<f32> {
         node.children.iter().find_map(|c| walk(dom, *c, at, target))
     }
     walk(dom, 0, 0.0, target)
+}
+
+/// Every `data-index` element with its absolute top, in one walk.
+///
+/// One walk, not one search per index: `find_by_attr` scans the whole tree, so
+/// asking it 361 times to find out which cards are on a page is quadratic.
+pub fn indexed_tops(dom: &BaseDocument) -> Vec<(usize, f32)> {
+    fn walk(dom: &BaseDocument, id: usize, y: f32, out: &mut Vec<(usize, f32)>) {
+        let Some(node) = dom.get_node(id) else { return };
+        let at = y + node.final_layout.location.y;
+        if let NodeData::Element(el) = &node.data {
+            if let Some(a) = el.attrs.iter().find(|a| &*a.name.local == "data-index") {
+                if let Ok(i) = a.value.parse::<usize>() {
+                    out.push((i, at));
+                }
+            }
+        }
+        for c in &node.children {
+            walk(dom, *c, at, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(dom, 0, 0.0, &mut out);
+    out
+}
+
+/// Absolute content-box origin of a node, measured the same way atoms are: the
+/// parley layout inside an element starts at its content box, not its border box.
+pub fn node_origin(dom: &BaseDocument, target: usize) -> Option<(f32, f32)> {
+    fn walk(
+        dom: &BaseDocument,
+        id: usize,
+        at: (f32, f32),
+        target: usize,
+    ) -> Option<(f32, f32)> {
+        let node = dom.get_node(id)?;
+        let l = &node.final_layout;
+        let here = (at.0 + l.location.x, at.1 + l.location.y);
+        if id == target {
+            return Some((
+                here.0 + l.border.left + l.padding.left,
+                here.1 + l.border.top + l.padding.top,
+            ));
+        }
+        node.children.iter().find_map(|c| walk(dom, *c, here, target))
+    }
+    walk(dom, 0, (0.0, 0.0), target)
+}
+
+/// Absolute border-box rectangle of a node, as `(x, y, width, height)`.
+///
+/// Used to find out where the HUD put a control, so an icon can be drawn into
+/// it: the bundled faces have no symbol glyphs, so the icons are painted rather
+/// than typeset.
+pub fn node_rect(dom: &BaseDocument, target: usize) -> Option<(f32, f32, f32, f32)> {
+    fn walk(
+        dom: &BaseDocument,
+        id: usize,
+        at: (f32, f32),
+        target: usize,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let node = dom.get_node(id)?;
+        let l = &node.final_layout;
+        let here = (at.0 + l.location.x, at.1 + l.location.y);
+        if id == target {
+            return Some((here.0, here.1, l.size.width, l.size.height));
+        }
+        node.children.iter().find_map(|c| walk(dom, *c, here, target))
+    }
+    walk(dom, 0, (0.0, 0.0), target)
+}
+
+/// Nearest ancestor (or self) that owns an inline layout.
+///
+/// A selection lives in one parley layout, and only the element that
+/// establishes an inline formatting context has one — a hit usually lands on a
+/// text node or an inline `<em>` inside it.
+pub fn text_element(dom: &BaseDocument, mut id: usize) -> Option<usize> {
+    loop {
+        let node = dom.get_node(id)?;
+        if let NodeData::Element(el) = &node.data {
+            if el.inline_layout_data.is_some() {
+                return Some(id);
+            }
+        }
+        id = node.parent?;
+    }
+}
+
+pub fn text_layout(dom: &BaseDocument, id: usize) -> Option<&blitz_dom::node::TextLayout> {
+    let node = dom.get_node(id)?;
+    match &node.data {
+        NodeData::Element(el) => el.inline_layout_data.as_deref(),
+        _ => None,
+    }
+}
+
+/// Rectangles covering a selection, in flow coordinates, as `(x0, y0, x1, y1)`.
+pub fn selection_rects(
+    dom: &BaseDocument,
+    id: usize,
+    sel: &parley::Selection,
+) -> Vec<(f32, f32, f32, f32)> {
+    let (Some(tl), Some((ox, oy))) = (text_layout(dom, id), node_origin(dom, id)) else {
+        return Vec::new();
+    };
+    sel.geometry(&tl.layout)
+        .into_iter()
+        .map(|(b, _)| {
+            (
+                ox + b.x0 as f32,
+                oy + b.y0 as f32,
+                ox + b.x1 as f32,
+                oy + b.y1 as f32,
+            )
+        })
+        .collect()
+}
+
+/// Rectangles for a stored highlight: a character offset and length inside one
+/// element, converted back to the byte range parley works in.
+///
+/// Offsets are stored as *characters* because that is what a CFI means by
+/// `:offset`; parley counts bytes. Converting at this boundary keeps the stored
+/// CFI honest without making the rest of the code think in bytes.
+pub fn highlight_rects(
+    dom: &BaseDocument,
+    id: usize,
+    char_start: usize,
+    char_len: usize,
+) -> Vec<(f32, f32, f32, f32)> {
+    let Some(tl) = text_layout(dom, id) else { return Vec::new() };
+    let byte = |chars: usize| -> usize {
+        tl.text.char_indices().nth(chars).map_or(tl.text.len(), |(b, _)| b)
+    };
+    let (b0, b1) = (byte(char_start), byte(char_start + char_len));
+    if b1 <= b0 {
+        return Vec::new();
+    }
+    let sel = parley::Selection::new(
+        parley::Cursor::from_byte_index(&tl.layout, b0, parley::Affinity::Downstream),
+        parley::Cursor::from_byte_index(&tl.layout, b1, parley::Affinity::Upstream),
+    );
+    selection_rects(dom, id, &sel)
+}
+
+/// Character offset and count for a byte range in an element's text, plus the
+/// text itself — what a highlight has to store.
+pub fn char_span(dom: &BaseDocument, id: usize, bytes: std::ops::Range<usize>) -> Option<(usize, usize, String)> {
+    let tl = text_layout(dom, id)?;
+    let text = tl.text.get(bytes.clone())?;
+    let start = tl.text.get(..bytes.start)?.chars().count();
+    Some((start, text.chars().count(), text.to_string()))
 }
 
 /// The first element whose text contains `needle`, folded so an unaccented

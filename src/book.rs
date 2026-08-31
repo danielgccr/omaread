@@ -20,6 +20,8 @@ pub struct TocEntry {
     /// navigation entries — a contents entry knows its element, a hit knows only
     /// its words.
     pub find: Option<String>,
+    /// A stored CFI to resolve, for a bookmark or highlight in the marks list.
+    pub cfi: Option<String>,
 }
 
 /// An open book. Cheap to clone; the archive is shared.
@@ -105,6 +107,18 @@ impl Book {
         self.spine.len()
     }
 
+    /// Byte offset and length of one spine item — the weights reading progress
+    /// and the page estimate are both built on.
+    pub fn span(&self, spine: usize) -> (usize, usize) {
+        let start = self.offsets.get(spine).copied().unwrap_or(0);
+        let end = self.offsets.get(spine + 1).copied().unwrap_or(start);
+        (start, end.saturating_sub(start))
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.offsets.last().copied().unwrap_or(0)
+    }
+
     /// How far through the whole book a position is, as 0.0..=1.0.
     ///
     /// `within` is the fraction through the spine item, so the figure moves
@@ -182,6 +196,7 @@ fn read_toc(epub: &Epub, spine: &[String]) -> Vec<TocEntry> {
                     .and_then(|h| h.fragment())
                     .map(str::to_string),
                 find: None,
+                cfi: None,
             });
         }
     }
@@ -203,6 +218,7 @@ fn read_toc(epub: &Epub, spine: &[String]) -> Vec<TocEntry> {
                 spine: i,
                 fragment: None,
                 find: None,
+                cfi: None,
             })
             .collect();
     }

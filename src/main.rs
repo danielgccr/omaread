@@ -40,6 +40,15 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+/// A highlighter is opaque enough to see and transparent enough to read
+/// through; the selection is the same idea in the system's blue.
+pub const HIGHLIGHT: Color = Color::from_rgba8(0xff, 0xd6, 0x2e, 0x66);
+const SELECTION: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x40);
+/// The library's selected card, outlined rather than filled so the cover shows.
+pub const CARD_OUTLINE: Color = Color::from_rgb8(0x0a, 0x84, 0xff);
+/// The card under the pointer. Light enough to read the cover through.
+const CARD_HOVER: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x24);
+
 /// How long the reading HUD lingers after the pointer stops moving.
 const HUD_LINGER: Duration = Duration::from_millis(2200);
 
@@ -47,9 +56,171 @@ const HUD_LINGER: Duration = Duration::from_millis(2200);
 /// something unreadable, so two-column mode silently falls back to one.
 const TWO_COLUMN_MIN_EM: f32 = 2.0 * (MEASURE_EM + 2.0 * GUTTER_EM);
 
+/// Whether two columns actually fit, and are wanted.
+///
+/// Below the minimum the measure would squeeze into something unreadable, so it
+/// silently falls back to one (CONTEXT.md §3). The library and the contents are
+/// single documents laid out at window width, so they are always one column.
+fn columns_for(requested: usize, css_width: f32, font_px: f32, reading: bool) -> usize {
+    let fits = css_width >= TWO_COLUMN_MIN_EM * font_px;
+    match requested >= 2 && fits && reading {
+        true => 2,
+        false => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::columns_for;
+    use crate::style::{GUTTER_EM, MEASURE_EM};
+
+    /// A taller window shows more cards, and the covers were chosen for the old
+    /// height — so the newly revealed row came up bare. Resizing re-paginates the
+    /// grid in place; it has to notice the visible set changed.
+    /// The CSS and `grid::per_row` must agree about how many cards fit, or arrow
+    /// keys step onto columns that are not there. Asserted against a real
+    /// layout, not against the arithmetic on its own.
+    #[test]
+    fn the_laid_out_row_holds_what_per_row_says() {
+        use crate::db::BookRow;
+
+        let rows: Vec<BookRow> = (0..40)
+            .map(|i| BookRow { hash: format!("h{i}"), title: format!("L{i}"), ..Default::default() })
+            .collect();
+        let ua = crate::grid::stylesheet("#fff", "#111", "#888", "#eee");
+
+        for width in [900u32, 1200, 1517, 2000, 3840] {
+            let doc = crate::chapter::layout_document(
+                crate::grid::html(&rows, "", crate::db::Sort::Recent, &[], None, 0..rows.len()),
+                ua.clone(),
+                None,
+                crate::chapter::viewport(width, 2400, 1.0, false),
+                2300.0,
+            )
+            .expect("the grid must lay out");
+
+            let tops = crate::chapter::indexed_tops(doc.dom());
+            let first = tops.first().map(|&(_, y)| y).unwrap_or(0.0);
+            let in_row = tops.iter().filter(|&&(_, y)| (y - first).abs() < 1.0).count();
+
+            assert_eq!(
+                in_row,
+                crate::grid::per_row(width as f32),
+                "at {width}px the layout put {in_row} in a row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_taller_window_reveals_cards_the_covers_did_not_cover() {
+        use crate::db::BookRow;
+
+        let rows: Vec<BookRow> = (0..40)
+            .map(|i| BookRow {
+                hash: format!("h{i}"),
+                title: format!("Libro {i}"),
+                author: "Autor".into(),
+                cover: Some(vec![0]),
+                ..Default::default()
+            })
+            .collect();
+        let ua = crate::grid::stylesheet("#fff", "#111", "#888", "#eee");
+        let markup = crate::grid::html(
+            &rows,
+            "",
+            crate::db::Sort::Recent,
+            &[],
+            None,
+            0..rows.len(),
+        );
+
+        // A window with room for one row, then one with room for more.
+        let short = 620.0_f32;
+        let tall = 1400.0_f32;
+        let mut doc = crate::chapter::layout_document(
+            markup,
+            ua,
+            None,
+            crate::chapter::viewport(1500, short as u32, 1.0, false),
+            short - 100.0,
+        )
+        .expect("the grid must lay out");
+
+        let before = super::visible_cards(&doc, 0);
+        crate::chapter::relayout(
+            &mut doc,
+            crate::chapter::viewport(1500, tall as u32, 1.0, false),
+            tall - 100.0,
+        );
+        let after = super::visible_cards(&doc, 0);
+
+        assert!(
+            after.end > before.end,
+            "a taller window should show more cards: {before:?} -> {after:?}"
+        );
+    }
+
+    /// Rendering a control is not the same as being able to click it: the HUD is
+    /// hit-tested at window coordinates, so every button has to actually occupy
+    /// some. Scans across both bars rather than guessing exact text widths.
+    #[test]
+    fn every_hud_control_is_hittable() {
+        use std::collections::HashSet;
+
+        let (w, h) = (1200u32, 900u32);
+        let doc = crate::chapter::layout_document(
+            crate::hud::html("Un libro", "page 8 of 19", 2, false, h as f32),
+            crate::hud::stylesheet("#111", "#888", "#eee"),
+            None,
+            crate::chapter::viewport(w, h, 1.0, false),
+            h as f32,
+        )
+        .expect("the HUD must lay out");
+
+        // Middle of the top bar, and of the bottom one.
+        let mut found: HashSet<String> = HashSet::new();
+        for y in [33.0_f32, h as f32 - 33.0] {
+            for x in (0..w).step_by(4) {
+                if let Some(hit) = doc.doc.hit(x as f32, y) {
+                    if let Some(what) =
+                        crate::ancestor_attr(doc.dom(), hit.node_id, "data-hud")
+                    {
+                        found.insert(what);
+                    }
+                }
+            }
+        }
+
+        for want in ["bookmark", "contents", "highlight", "smaller", "bigger", "columns", "readout"]
+        {
+            assert!(found.contains(want), "{want} is drawn but not clickable: {found:?}");
+        }
+    }
+
+    /// Two columns are only worth having when each still gets a real measure;
+    /// below that the fallback has to be silent, not a squeezed 38ch column.
+    #[test]
+    fn two_columns_need_the_width_and_the_reading_view() {
+        let em = 20.0;
+        let min = 2.0 * (MEASURE_EM + 2.0 * GUTTER_EM) * em;
+
+        assert_eq!(columns_for(2, min, em, true), 2);
+        assert_eq!(columns_for(2, min - 1.0, em, true), 1, "too narrow falls back");
+        assert_eq!(columns_for(1, min * 2.0, em, true), 1, "not asked for");
+        // The library and the contents are one document at window width.
+        assert_eq!(columns_for(2, min, em, false), 1);
+        // A bigger font needs a wider window for the same two columns.
+        assert_eq!(columns_for(2, min, em * 1.6, true), 1);
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 /// `#rrggbb` to a colour. The chrome palette is authored as CSS strings so the
 /// stylesheet and the window ground cannot drift apart.
-fn parse_hex(s: &str) -> Color {
+pub fn parse_hex(s: &str) -> Color {
     let h = s.trim_start_matches('#');
     let v = u32::from_str_radix(h, 16).unwrap_or(0);
     Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
@@ -86,10 +257,13 @@ fn main() {
              omaread --check <book.epub>...  headless conformance run\n\
              omaread --shot <book.epub> <chapter> <page> <out.ppm> [hud]\n\
              omaread --index                 index every library book for search\n\n\
-             Library:  type to search · Enter open · Tab sort · F5 rescan · Esc clear/quit\n\
-             Reading:  ←/→ page · ↑/↓ chapter · Tab contents · / search · t theme · +/- size · l library · q quit\n\
-                       move the mouse for the title and how far through you are\n\
-             Contents: ↑/↓ select · Enter go · Tab or Esc back"
+             Library:  type to search · #tag to filter · F2 tag a book\n\
+                       Enter open · Tab sort · F5 rescan · Esc clear/quit\n\
+             Reading:  ←/→ page · ↑/↓ chapter · Tab contents · / search · t theme · +/- size · c columns · l library · q quit\n\
+                       move the mouse for the menus: marks, contents, size, columns\n\
+             Contents: ↑/↓ select · Enter go · Tab or Esc back\n\
+             Marks:    m list · b bookmark · drag to select · h highlight · y copy\n\
+                       in the list: n note · x delete"
         );
         return;
     }
@@ -105,6 +279,20 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(args.first().cloned(), start);
     event_loop.run_app(&mut app).expect("run event loop");
+
+    // ponytail: leave without running destructors. Dropping the renderer tears
+    // down wgpu's GLES/EGL instance — a backend this app never renders with, it
+    // exists only because wgpu enumerates all of them — and NVIDIA's
+    // egl-wayland layer then marshals a Wayland request on a dead proxy and
+    // segfaults. Every clean exit dumped core; see `exiting` for the stack.
+    //
+    // Nothing here needs a destructor to be correct: reading position and marks
+    // are committed to SQLite before this point, and WAL means a process that
+    // simply stops loses nothing. The OS reclaims the GPU and the fonts.
+    //
+    // Remove this when wgpu or the driver can survive its own teardown.
+    app.save_position();
+    std::process::exit(0);
 }
 
 /// Resources arrive from the provider on whatever thread fetched them; funnel
@@ -122,6 +310,15 @@ impl NetCallback<Resource> for ChannelCallback {
 /// Which surface is on screen. Every arm is a laid-out document — the library
 /// and the contents are HTML/CSS through the same pipeline as a book
 /// (CONTEXT.md §2); only where the markup comes from differs.
+/// What the contents view is listing. All three are "places in this book", so
+/// they share one document, one set of keys and one hit-test path.
+#[derive(Clone, Copy, PartialEq)]
+enum TocMode {
+    Contents,
+    Search,
+    Marks,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Library,
@@ -137,6 +334,17 @@ struct App {
     selected: usize,
     /// Rebuilt whenever the query, sort or selection changes.
     lib_doc: Option<Chapter>,
+    /// Completions for the library search box, refreshed with the rows.
+    suggestions: Vec<(String, String)>,
+    /// Cards the current grid document carries covers for. When the page moves
+    /// off this range the grid has to be built again.
+    lib_covers: std::ops::Range<usize>,
+    /// The page those covers were chosen for; turning past it needs a rebuild.
+    lib_page: usize,
+    /// The library card under the pointer, for hover feedback.
+    hover_card: Option<usize>,
+    /// A tag being typed for the selected book. Tagging borrows the search box.
+    tagging: Option<String>,
     /// The contents list. Rebuilt on every open and on every selection move.
     toc_doc: Option<Chapter>,
     /// Title and progress, painted over the page while the pointer is active.
@@ -145,13 +353,35 @@ struct App {
     /// because pointer motion arrives far faster than the text does.
     hud_key: String,
     hud_shown: bool,
+    /// The foot of the page shows a percentage until you click it, then a page
+    /// number. Clicking again swaps back.
+    show_page: bool,
+    /// The stored highlight the last press landed inside, if any. What makes the
+    /// menu offer "Remove" instead of "Highlight".
+    sel_mark: Option<i64>,
+    /// Measured pages per chapter, and the layout they were measured at. This is
+    /// what lets the readout say "page 27 of 336" and mean it.
+    chapter_pages: Option<Vec<usize>>,
+    pages_layout: String,
     /// In-book search: the query, and whether the contents view is showing hits
     /// instead of navigation. Both lists are "places in this book", so they are
     /// the same view.
     find: String,
-    finding: bool,
+    toc_mode: TocMode,
+    /// Marks for the open book; index-aligned with the list while in Marks mode.
+    marks: Vec<db::Mark>,
+    /// Live selection: the element it lives in, and parley's selection over it.
+    sel: Option<(usize, parley::Selection)>,
+    dragging: bool,
+    /// Mark being annotated, and the note as typed so far.
+    noting: Option<i64>,
+    note: String,
     /// When to put the HUD away. Drives `ControlFlow::WaitUntil`.
     hud_until: Option<Instant>,
+    /// `OMAREAD_EXIT_AFTER=<ms>` quits by itself. Shutdown is a real code path
+    /// with real bugs in it (see `exiting`), and it cannot be tested by hand or
+    /// in CI without a way to reach it that needs no window manager.
+    exit_at: Option<Instant>,
     toc_sel: usize,
     /// The reading page to come back to when the contents close. All three
     /// views share `page`, so it has to be put somewhere.
@@ -199,13 +429,31 @@ impl App {
             sort: Sort::Recent,
             selected: 0,
             lib_doc: None,
+            suggestions: Vec::new(),
+            lib_covers: 0..0,
+            lib_page: 0,
+            hover_card: None,
+            tagging: None,
             toc_doc: None,
             hud_doc: None,
             hud_key: String::new(),
             hud_shown: false,
+            show_page: false,
+            sel_mark: None,
+            chapter_pages: None,
+            pages_layout: String::new(),
             find: String::new(),
-            finding: false,
+            toc_mode: TocMode::Contents,
+            marks: Vec::new(),
+            sel: None,
+            dragging: false,
+            noting: None,
+            note: String::new(),
             hud_until: None,
+            exit_at: std::env::var("OMAREAD_EXIT_AFTER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(|ms| Instant::now() + Duration::from_millis(ms)),
             toc_sel: 0,
             resume_page: 0,
             book: None,
@@ -214,7 +462,12 @@ impl App {
             path: String::new(),
             pending: None,
             hyphenator: None,
-            style: ReadingStyle::default(),
+            style: ReadingStyle {
+                scale: style::setting("font-scale")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1.0),
+                ..ReadingStyle::default()
+            },
             chrome: style::omarchy_chrome(),
             chapter: None,
             index: start,
@@ -258,7 +511,45 @@ impl App {
             .and_then(|d| d.lock().ok()?.books(&self.query, self.sort).ok())
             .unwrap_or_default();
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.suggestions = self.completions();
         self.lib_doc = None;
+    }
+
+    /// What to offer under the search box: tags while tagging or filtering by
+    /// one, words and authors otherwise.
+    fn completions(&self) -> Vec<(String, String)> {
+        let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) else { return Vec::new() };
+
+        let tag_prefix = match (&self.tagging, self.query.trim().strip_prefix('#')) {
+            (Some(t), _) => Some(t.as_str()),
+            (None, Some(q)) => Some(q),
+            (None, None) => None,
+        };
+        if let Some(prefix) = tag_prefix {
+            return db
+                .all_tags(prefix)
+                .into_iter()
+                .map(|(tag, n)| (format!("#{tag}"), format!("{n} book{}", plural(n))))
+                .collect();
+        }
+        match self.query.trim().is_empty() {
+            true => Vec::new(),
+            false => db.suggestions(&self.query, 6),
+        }
+    }
+
+    /// Toggle the typed tag on the selected book. One key, both directions.
+    fn apply_tag(&mut self) {
+        let Some(tag) = self.tagging.take() else { return };
+        let Some(row) = self.rows.get(self.selected).cloned() else { return };
+        if let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) {
+            match db.toggle_tag(&row.hash, &tag) {
+                Ok(true) => println!("omaread: tagged {} #{tag}", row.title),
+                Ok(false) => println!("omaread: untagged {} #{tag}", row.title),
+                Err(e) => eprintln!("omaread: could not tag: {e}"),
+            }
+        }
+        self.reload_rows();
     }
 
     /// Import if needed, then open for reading.
@@ -306,7 +597,12 @@ impl App {
         self.book = Some(book);
         self.index = start;
         self.view = View::Reading;
-        self.load_chapter(start);
+        // Before the window exists the size is a guess, and `resumed` reloads
+        // at the real one — laying the chapter out twice at startup, which for
+        // an illustrated book is a wasted 120ms.
+        if self.window.is_some() {
+            self.load_chapter(start);
+        }
         self.request_redraw();
     }
 
@@ -322,38 +618,98 @@ impl App {
     /// Lay out the library grid. Rebuilt on any change to query, sort or
     /// selection — the whole document is cheap next to a chapter, and an
     /// incremental DOM diff is complexity nobody has asked for.
+    /// Lay out the library grid.
+    ///
+    /// Twice, deliberately. Loading a cover costs far more than laying out a
+    /// card — 1817ms against 91ms for 361 books, measured — and only about
+    /// fourteen covers are ever on screen. The first pass carries no covers and
+    /// exists solely to find out which cards this page shows; the second gives
+    /// those cards their covers. Before this, returning to the library blocked
+    /// for nearly two seconds and swallowed the clicks that arrived meanwhile.
     fn build_library(&mut self) {
+        let started = Instant::now();
         let (bg, fg, subtle, panel) = self.chrome();
-        let html = grid::html(&self.rows, &self.query, self.sort, self.selected);
         let ua = grid::stylesheet(&bg, &fg, &subtle, &panel);
+        let markup = |covers: std::ops::Range<usize>| {
+            grid::html(
+                &self.rows,
+                &self.query,
+                self.sort,
+                &self.suggestions,
+                self.tagging.as_deref(),
+                covers,
+            )
+        };
+
+        // The probe carries the *same* markup as the real grid — every card with
+        // its `<img>` — and simply has no provider to fetch through. Anything
+        // less paginates differently: a blank jacket is text, which a page break
+        // may fall inside, while a cover is an image block that cannot be split,
+        // so a probe made of jackets fitted two rows where covers fit one.
+        let probe = chapter::layout_document(
+            markup(0..self.rows.len()),
+            ua.clone(),
+            None,
+            self.viewport(),
+            self.page_height(),
+        );
+        let visible = probe
+            .as_ref()
+            .map(|d| visible_cards(d, self.page))
+            .unwrap_or(0..self.rows.len());
 
         let provider = self.db.clone().map(|db| {
             Arc::new(net::CoverProvider::new(db, self.callback()))
                 as Arc<dyn blitz_traits::net::NetProvider<Resource>>
         });
-
-        self.lib_doc =
-            chapter::layout_document(html, ua, provider, self.viewport(), self.page_height());
+        self.lib_doc = chapter::layout_document(
+            markup(visible.clone()),
+            ua,
+            provider,
+            self.viewport(),
+            self.page_height(),
+        );
+        self.lib_covers = visible;
         self.page = self
             .page
             .min(self.lib_doc.as_ref().map_or(0, |c| c.pages.count().saturating_sub(1)));
+        self.lib_page = self.page;
+
+        if std::env::var_os("OMAREAD_DEBUG_TIME").is_some() {
+            eprintln!(
+                "TIME grid rebuild: {} rows, covers {:?} in {:.0}ms",
+                self.rows.len(),
+                self.lib_covers,
+                started.elapsed().as_secs_f32() * 1000.0
+            );
+        }
     }
+
 
     /// Lay out the HUD, unless the one in hand already says the right thing.
     fn build_hud(&mut self) {
         let Some(book) = self.book.clone() else { return };
-        let percent = (self.progress() * 100.0).round() as u8;
+        let readout = self.readout();
+        let cols = self.effective_columns();
         let height = self.size.1 as f32 / self.scale;
-        let key = format!("{percent}|{height}|{:?}|{}", self.style.theme, book.title);
+        let on_mark = self.sel_mark.is_some();
+        let key =
+            format!("{readout}|{cols}|{on_mark}|{height}|{:?}|{}", self.style.theme, book.title);
         if key == self.hud_key && self.hud_doc.is_some() {
             return;
         }
 
         let (_, fg, subtle, panel) = self.chrome();
-        let html = hud::html(&book.title, percent, height);
+        let html = hud::html(&book.title, &readout, cols, on_mark, height);
         let ua = hud::stylesheet(&fg, &subtle, &panel);
-        self.hud_doc =
-            chapter::layout_document(html, ua, None, self.viewport(), self.page_height());
+        // The HUD spans the window; only the page is laid out at column width.
+        let vp = chapter::viewport(
+            self.size.0,
+            self.size.1,
+            self.scale,
+            self.style.theme == Theme::Night,
+        );
+        self.hud_doc = chapter::layout_document(html, ua, None, vp, self.page_height());
         self.hud_key = key;
     }
 
@@ -369,6 +725,453 @@ impl App {
             // Search is a convenience; a failure here must not stop you reading.
             Err(e) => eprintln!("omaread: could not index: {e}"),
         }
+    }
+
+    /// Marks, selection, notes and copy — everything Phase 7 adds.
+    fn open_marks(&mut self) {
+        self.marks = self.load_marks();
+        self.toc_mode = TocMode::Marks;
+        self.open_toc();
+    }
+
+    fn load_marks(&self) -> Vec<db::Mark> {
+        self.db
+            .as_ref()
+            .and_then(|d| d.lock().ok())
+            .map(|d| d.marks(&self.hash))
+            .unwrap_or_default()
+    }
+
+    /// CFI of the element this page begins at — the anchor for a bookmark, and
+    /// the same one reading progress uses.
+    fn cfi_of_page(&self) -> Option<cfi::Cfi> {
+        let ch = self.chapter.as_ref()?;
+        let node = chapter::node_at(ch.dom(), ch.pages.top_of(self.page))?;
+        cfi::of_node(ch.dom(), node, self.index)
+    }
+
+    fn toggle_bookmark(&mut self) {
+        let Some(cfi) = self.cfi_of_page() else { return };
+        let cfi = cfi.to_string();
+        let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) else { return };
+
+        match db.bookmark_at(&self.hash, &cfi) {
+            Some(id) => {
+                let _ = db.remove_mark(id);
+                println!("omaread: bookmark removed");
+            }
+            None => {
+                let mark = db::Mark { cfi, ..Default::default() };
+                match db.add_mark(&self.hash, &mark) {
+                    Ok(()) => println!("omaread: bookmarked page {}", self.page + 1),
+                    Err(e) => eprintln!("omaread: could not bookmark: {e}"),
+                }
+            }
+        }
+    }
+
+    /// The selection as (element, byte range).
+    fn selected(&self) -> Option<(usize, std::ops::Range<usize>)> {
+        let (node, sel) = self.sel.as_ref()?;
+        let range = sel.text_range();
+        (!range.is_empty()).then(|| (*node, range))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (node, range) = self.selected()?;
+        let ch = self.chapter.as_ref()?;
+        chapter::char_span(ch.dom(), node, range).map(|(_, _, text)| text)
+    }
+
+    fn highlight_selection(&mut self) {
+        let Some((node, range)) = self.selected() else {
+            println!("omaread: nothing selected — drag across a paragraph first");
+            return;
+        };
+        let Some(ch) = self.chapter.as_ref() else { return };
+        let Some((start, len, text)) = chapter::char_span(ch.dom(), node, range) else { return };
+        let Some(mut cfi) = cfi::of_node(ch.dom(), node, self.index) else { return };
+        cfi.offset = Some(start);
+
+        let mark = db::Mark {
+            cfi: cfi.to_string(),
+            length: len,
+            text,
+            ..Default::default()
+        };
+        if let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) {
+            match db.add_mark(&self.hash, &mark) {
+                Ok(()) => println!("omaread: highlighted “{}”", mark.text),
+                Err(e) => eprintln!("omaread: could not highlight: {e}"),
+            }
+        }
+        self.sel = None;
+        self.request_redraw();
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selected_text() else {
+            println!("omaread: nothing selected");
+            return;
+        };
+        // ponytail: wl-copy rather than a clipboard crate. Wayland is the
+        // target (§1) and this is one process instead of one dependency; swap in
+        // a crate if a non-Wayland target ever matters.
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let spawned = Command::new("wl-copy").stdin(Stdio::piped()).spawn();
+        match spawned {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+                println!("omaread: copied {} characters", text.chars().count());
+            }
+            Err(e) => eprintln!("omaread: could not run wl-copy ({e}); install wl-clipboard"),
+        }
+    }
+
+    fn begin_note(&mut self) {
+        let Some(mark) = self.marks.get(self.toc_sel) else { return };
+        self.note = mark.note.clone();
+        self.noting = Some(mark.id);
+    }
+
+    fn save_note(&mut self) {
+        let Some(id) = self.noting.take() else { return };
+        if let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) {
+            if let Err(e) = db.set_note(id, &self.note) {
+                eprintln!("omaread: could not save note: {e}");
+            }
+        }
+        self.note.clear();
+        self.marks = self.load_marks();
+    }
+
+    fn delete_mark(&mut self) {
+        let Some(mark) = self.marks.get(self.toc_sel) else { return };
+        let id = mark.id;
+        if let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) {
+            let _ = db.remove_mark(id);
+        }
+        self.marks = self.load_marks();
+        self.toc_sel = self.toc_sel.min(self.marks.len().saturating_sub(1));
+    }
+
+    /// Flow-coordinate rectangles to paint over this page: the live selection,
+    /// and every stored highlight in this chapter.
+    fn selection_rects(&self) -> Vec<(f32, f32, f32, f32)> {
+        let Some(ch) = self.chapter.as_ref() else { return Vec::new() };
+        match &self.sel {
+            Some((node, sel)) => chapter::selection_rects(ch.dom(), *node, sel),
+            None => Vec::new(),
+        }
+    }
+
+    /// ponytail: re-queried every frame. It is one indexed read on a WAL
+    /// database and only matters while dragging; cache per chapter if a profile
+    /// ever shows it.
+    fn highlight_rects(&self) -> Vec<(f32, f32, f32, f32)> {
+        let (Some(ch), Some(db)) = (
+            self.chapter.as_ref(),
+            self.db.as_ref().and_then(|d| d.lock().ok()),
+        ) else {
+            return Vec::new();
+        };
+        db.marks_in(&self.hash, self.index)
+            .iter()
+            .filter_map(|m| {
+                let c = cfi::Cfi::parse(&m.cfi)?;
+                let node = cfi::resolve(ch.dom(), &c)?;
+                Some(chapter::highlight_rects(ch.dom(), node, c.offset?, m.length))
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Begin a selection at the pointer. Coordinates arrive in physical pixels.
+    fn begin_selection(&mut self) {
+        // Remember a highlight under the press, so the menu can offer to remove
+        // it — "select a highlight, then remove it from the menu".
+        self.sel_mark = self.mark_at(self.pointer_in_flow());
+        let Some(local) = self.pointer_in_text() else {
+            self.sel = None;
+            self.request_redraw();
+            return;
+        };
+        let (node, x, y) = local;
+        let Some(ch) = self.chapter.as_ref() else { return };
+        let Some(tl) = chapter::text_layout(ch.dom(), node) else { return };
+        self.sel = Some((node, parley::Selection::from_point(&tl.layout, x, y)));
+        self.dragging = true;
+    }
+
+    /// Extend the selection. The anchor's element is kept: a selection lives in
+    /// one parley layout.
+    ///
+    /// ponytail: one paragraph at a time. Selecting across paragraphs means
+    /// stitching several layouts and is a bigger job than it looks; parley
+    /// clamps a drag past the end, so dragging down selects to the paragraph's
+    /// end rather than doing nothing.
+    fn extend_selection(&mut self) {
+        let Some((node, sel)) = self.sel.take() else { return };
+        let Some(ch) = self.chapter.as_ref() else { return };
+        let (Some(tl), Some((ox, oy))) = (
+            chapter::text_layout(ch.dom(), node),
+            chapter::node_origin(ch.dom(), node),
+        ) else {
+            return;
+        };
+        let (fx, fy) = self.pointer_in_flow();
+        let next = sel.extend_to_point(&tl.layout, fx - ox, fy - oy);
+        self.sel = Some((node, next));
+        self.request_redraw();
+    }
+
+    /// Pointer position in flow coordinates (CSS pixels into the chapter).
+    ///
+    /// In two-column mode the right half of the window is a different page of
+    /// the same flow, so the column under the pointer decides both the vertical
+    /// offset and how much to take off the x.
+    fn pointer_in_flow(&self) -> (f32, f32) {
+        let cols = self.effective_columns();
+        let col_w = (self.size.0 as f32 / self.scale) / cols as f32;
+        let x = self.cursor.0 / self.scale;
+        let col = ((x / col_w).floor() as usize).min(cols - 1);
+        let page = (self.page + col).min(self.page_count().saturating_sub(1));
+        let top = self.chapter.as_ref().map_or(0.0, |c| c.pages.top_of(page));
+        (
+            x - col as f32 * col_w,
+            self.cursor.1 / self.scale - self.page_margin() + top,
+        )
+    }
+
+    /// The text element under the pointer, with pointer coordinates local to it.
+    fn pointer_in_text(&self) -> Option<(usize, f32, f32)> {
+        let ch = self.chapter.as_ref()?;
+        let (fx, fy) = self.pointer_in_flow();
+        let hit = ch.doc.hit(fx, fy)?;
+        let node = chapter::text_element(ch.dom(), hit.node_id)?;
+        let (ox, oy) = chapter::node_origin(ch.dom(), node)?;
+        Some((node, fx - ox, fy - oy))
+    }
+
+    /// What the foot of the page says.
+    fn readout(&self) -> String {
+        match self.show_page {
+            true => {
+                let (page, total) = self.book_page();
+                format!("page {page} of {total}")
+            }
+            false => format!("{}%", (self.progress() * 100.0).round() as u8),
+        }
+    }
+
+    /// Page number across the whole book, not the chapter.
+    ///
+    /// The current chapter is measured — it is laid out — so its pages-per-byte
+    /// converts the book's byte length into a page count. Chapters are only ever
+    /// paginated on demand, and doing every one of a 131-chapter book to get an
+    /// exact total would cost seconds on open.
+    ///
+    /// ponytail: an estimate, so the total drifts a few percent as you move
+    /// between chapters of different density. Cache measured page counts per
+    /// (chapter, font size, column width) if it ever needs to be exact.
+    fn book_page(&self) -> (usize, usize) {
+        match self.measured_pages() {
+            Some(per_chapter) => {
+                let before: usize = per_chapter.iter().take(self.index).sum();
+                let total: usize = per_chapter.iter().sum();
+                ((before + self.page + 1).min(total.max(1)), total.max(1))
+            }
+            // Not measured at this layout: the chapter's own numbering, which is
+            // true, rather than an estimate that is not.
+            None => (self.page + 1, self.page_count()),
+        }
+    }
+
+    /// The cached counts, but only if they were measured at the layout now on
+    /// screen — pagination depends on font size and column width.
+    fn measured_pages(&self) -> Option<&Vec<usize>> {
+        (self.pages_layout == self.layout_key()).then_some(self.chapter_pages.as_ref()?)
+    }
+
+    fn layout_key(&self) -> String {
+        format!("{:.0}x{}", self.style.font_px(), self.column_width())
+    }
+
+    /// Measure every chapter so the readout can give a real page number.
+    ///
+    /// Cached in the database per book and layout, so this runs once: three
+    /// seconds for a 131-chapter book, and instant every time after. Called from
+    /// the click that asks for page numbers, never from a redraw.
+    fn measure_book(&mut self) {
+        let key = self.layout_key();
+        if self.pages_layout == key && self.chapter_pages.is_some() {
+            return;
+        }
+        let Some(book) = self.book.clone() else { return };
+        let count = book.chapter_count();
+
+        if let Some(cached) = self
+            .db
+            .as_ref()
+            .and_then(|d| d.lock().ok())
+            .and_then(|d| d.pagination(&self.hash, &key, count))
+        {
+            self.chapter_pages = Some(cached);
+            self.pages_layout = key;
+            return;
+        }
+
+        println!("omaread: measuring {count} chapters for page numbers…");
+        let started = Instant::now();
+        let pages = chapter::page_counts(
+            &book,
+            &self.style,
+            self.hyphenator.as_ref(),
+            self.column_width(),
+            self.size.1,
+            self.scale,
+            self.page_height(),
+        );
+
+        let total: usize = pages.iter().sum();
+        println!(
+            "omaread: {total} pages at {key} ({:.1}s)",
+            started.elapsed().as_secs_f32()
+        );
+        if let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) {
+            if let Err(e) = db.save_pagination(&self.hash, &key, &pages) {
+                eprintln!("omaread: could not save page counts: {e}");
+            }
+        }
+        self.chapter_pages = Some(pages);
+        self.pages_layout = key;
+    }
+
+    /// The stored highlight containing a flow position, if any.
+    fn mark_at(&self, flow: (f32, f32)) -> Option<i64> {
+        let ch = self.chapter.as_ref()?;
+        let db = self.db.as_ref()?.lock().ok()?;
+        db.marks_in(&self.hash, self.index).into_iter().find_map(|m| {
+            let c = cfi::Cfi::parse(&m.cfi)?;
+            let node = cfi::resolve(ch.dom(), &c)?;
+            let rects = chapter::highlight_rects(ch.dom(), node, c.offset?, m.length);
+            let inside = rects.iter().any(|&(x0, y0, x1, y1)| {
+                flow.0 >= x0 && flow.0 <= x1 && flow.1 >= y0 && flow.1 <= y1
+            });
+            inside.then_some(m.id)
+        })
+    }
+
+    fn remove_selected_mark(&mut self) {
+        let Some(id) = self.sel_mark.take() else { return };
+        if let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) {
+            match db.remove_mark(id) {
+                Ok(()) => println!("omaread: highlight removed"),
+                Err(e) => eprintln!("omaread: could not remove: {e}"),
+            }
+        }
+        self.sel = None;
+        self.request_redraw();
+    }
+
+    /// Where each HUD icon goes, as `(icon, rect)` in CSS pixels. The HUD
+    /// reserves an empty box per control and the window fills it in.
+    fn hud_icons(&self) -> Vec<(paint::Icon, (f32, f32, f32, f32))> {
+        let Some(hud) = &self.hud_doc else { return Vec::new() };
+        [
+            ("bookmark", paint::Icon::Bookmark),
+            ("contents", paint::Icon::Contents),
+            ("highlight", paint::Icon::Highlight),
+            ("back", paint::Icon::Back),
+        ]
+        .into_iter()
+        .filter_map(|(name, icon)| {
+            let node = find_by_attr(hud.dom(), 0, "data-icon", name)?;
+            Some((icon, chapter::node_rect(hud.dom(), node)?))
+        })
+        .collect()
+    }
+
+    /// A control in the HUD under the pointer, if any. Returns true when it
+    /// handled the click, so the page does not also start a selection.
+    fn hud_action(&mut self) -> bool {
+        if !self.hud_shown || self.view != View::Reading {
+            return false;
+        }
+        // The HUD is laid out at window size and painted unscrolled, so screen
+        // CSS pixels are its own coordinates.
+        let what = {
+            let Some(hud) = &self.hud_doc else { return false };
+            let (x, y) = (self.cursor.0 / self.scale, self.cursor.1 / self.scale);
+            let Some(hit) = hud.doc.hit(x, y) else { return false };
+            match ancestor_attr(hud.dom(), hit.node_id, "data-hud") {
+                Some(what) => what,
+                None => return false,
+            }
+        };
+
+        match what.as_str() {
+            "bookmark" => self.toggle_bookmark(),
+            "contents" => {
+                self.toc_mode = TocMode::Contents;
+                self.open_toc();
+            }
+            "highlight" => self.highlight_selection(),
+            "unhighlight" => self.remove_selected_mark(),
+            "library" => {
+                self.to_library();
+                return true;
+            }
+            "smaller" => self.set_font_scale(self.style.scale - 0.1),
+            "bigger" => self.set_font_scale(self.style.scale + 0.1),
+            "columns" => self.toggle_columns(),
+            "readout" => {
+                self.show_page = !self.show_page;
+                if self.show_page {
+                    self.measure_book();
+                }
+            }
+            _ => return false,
+        }
+        // Acting on the HUD is using the HUD, so keep it up.
+        self.hud_doc = None;
+        self.poke_hud();
+        self.request_redraw();
+        true
+    }
+
+    /// Font size is a property of the reader, not of the book, so it is stored
+    /// once and applies to every book from then on.
+    fn set_font_scale(&mut self, scale: f32) {
+        let scale = scale.clamp(0.8, 1.6);
+        if (scale - self.style.scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.style.scale = scale;
+        style::set_setting("font-scale", &format!("{scale:.2}"));
+        println!("omaread: {:.0}px", self.style.font_px());
+        self.restyle();
+    }
+
+    fn toggle_columns(&mut self) {
+        self.columns = if self.columns == 2 { 1 } else { 2 };
+        let got = self.effective_columns();
+        println!(
+            "omaread: {got} column{}{}",
+            plural(got),
+            match self.columns == 2 && got == 1 {
+                true => " — window too narrow for two",
+                false => "",
+            }
+        );
+        // The document is laid out at column width, so the flow has to be
+        // re-measured.
+        self.relayout();
+        self.request_redraw();
     }
 
     /// How far through the book the current page is, 0.0..=1.0.
@@ -437,17 +1240,20 @@ impl App {
     fn build_toc(&mut self) {
         let Some(book) = self.book.clone() else { return };
         let entries = self.toc_entries();
-        let (heading, subtitle) = match self.finding {
-            true => (
+        let n = entries.len();
+        let (heading, subtitle) = match self.toc_mode {
+            TocMode::Search => (
                 "Search",
-                format!(
-                    "“{}” — {} hit{} in this book",
-                    self.find,
-                    entries.len(),
-                    if entries.len() == 1 { "" } else { "s" }
-                ),
+                format!("“{}” — {n} hit{} in this book", self.find, plural(n)),
             ),
-            false => ("Contents", book.title.clone()),
+            TocMode::Marks => (
+                "Marks",
+                match &self.noting {
+                    Some(_) => format!("note: {}|", self.note),
+                    None => format!("{n} bookmark{} and highlights", plural(n)),
+                },
+            ),
+            TocMode::Contents => ("Contents", book.title.clone()),
         };
         let (bg, fg, subtle, panel) = self.chrome();
         let html = toc::html(&entries, heading, &subtitle, self.index, self.toc_sel);
@@ -459,8 +1265,33 @@ impl App {
     /// What the contents view lists: the book's navigation, or search hits.
     fn toc_entries(&self) -> Vec<book::TocEntry> {
         let Some(book) = &self.book else { return Vec::new() };
-        if !self.finding {
-            return (*book.toc).clone();
+        match self.toc_mode {
+            TocMode::Contents => return (*book.toc).clone(),
+            TocMode::Marks => {
+                return self
+                    .marks
+                    .iter()
+                    .map(|m| {
+                        let spine = cfi::Cfi::parse(&m.cfi).map_or(0, |c| c.spine);
+                        let kind = if m.is_bookmark() { "Bookmark" } else { "Highlight" };
+                        let body = match (m.text.is_empty(), m.note.is_empty()) {
+                            (true, true) => format!("chapter {}", spine + 1),
+                            (true, false) => m.note.clone(),
+                            (false, true) => m.text.clone(),
+                            (false, false) => format!("{} — {}", m.text, m.note),
+                        };
+                        book::TocEntry {
+                            label: format!("{kind} · {body}"),
+                            depth: 0,
+                            spine,
+                            fragment: None,
+                            find: None,
+                            cfi: Some(m.cfi.clone()),
+                        }
+                    })
+                    .collect();
+            }
+            TocMode::Search => {}
         }
         let Some(fts) = search::fts_query(&self.find) else { return Vec::new() };
         let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) else { return Vec::new() };
@@ -483,6 +1314,7 @@ impl App {
                     spine: hit.spine,
                     fragment: None,
                     find: Some(self.find.clone()),
+                    cfi: None,
                 }
             })
             .collect()
@@ -494,9 +1326,10 @@ impl App {
         // Open on the entry covering where you are, not at the top: in a long
         // book the useful part of the contents is the part you are in. A search
         // starts at the best hit, which is the first one.
-        self.toc_sel = match self.finding {
-            true => 0,
-            false => toc.iter().rposition(|e| e.spine <= self.index).unwrap_or(0),
+        self.toc_sel = match self.toc_mode {
+            TocMode::Contents => toc.iter().rposition(|e| e.spine <= self.index).unwrap_or(0),
+            // A search starts at the best hit; marks are in reading order.
+            _ => 0,
         };
         self.view = View::Toc;
         self.page = 0;
@@ -506,7 +1339,8 @@ impl App {
     }
 
     fn close_toc(&mut self) {
-        self.finding = false;
+        self.toc_mode = TocMode::Contents;
+        self.noting = None;
         self.view = View::Reading;
         self.page = self.resume_page.min(self.page_count().saturating_sub(1));
         self.request_redraw();
@@ -522,6 +1356,18 @@ impl App {
             self.page = 0;
         } else {
             self.load_chapter(entry.spine);
+        }
+        // A stored mark knows its element exactly.
+        if let Some(raw) = &entry.cfi {
+            match cfi::Cfi::parse(raw)
+                .and_then(|c| {
+                    let ch = self.chapter.as_ref()?;
+                    let node = cfi::resolve(ch.dom(), &c)?;
+                    Some(ch.pages.page_containing(chapter::node_top(ch.dom(), node)?))
+                }) {
+                Some(page) => self.page = page,
+                None => eprintln!("omaread: {raw} no longer resolves"),
+            }
         }
         // A hit knows its words, not its element: locate the text in the
         // chapter that is now laid out.
@@ -581,18 +1427,13 @@ impl App {
     }
 
     /// How many columns actually paint.
-    ///
-    /// Two-column is specified (CONTEXT.md §3) and the paginator supports it —
-    /// pages `2n`/`2n+1` of one flow — but it cannot be *painted* yet:
-    /// `blitz_paint::paint_scene` resets the scene on entry, so a second call
-    /// erases the first, and `VelloScenePainter.inner` is `pub(crate)` so
-    /// per-column sub-scenes cannot be composed either. Needs an upstream
-    /// non-resetting paint entry point or access to the inner scene.
     fn effective_columns(&self) -> usize {
-        let css_w = self.size.0 as f32 / self.scale;
-        let _wide_enough = self.columns == 2
-            && css_w >= TWO_COLUMN_MIN_EM * self.style.font_px();
-        1
+        columns_for(
+            self.columns,
+            self.size.0 as f32 / self.scale,
+            self.style.font_px(),
+            self.view == View::Reading,
+        )
     }
 
     /// Width of one column in physical pixels.
@@ -682,6 +1523,7 @@ impl App {
     /// `backwards` opens the chapter on its last page, for turning back across a
     /// chapter boundary.
     fn load_chapter_at(&mut self, mut index: usize, backwards: bool) {
+        let started = Instant::now();
         let Some(book) = self.book.clone() else { return };
         let count = book.chapter_count();
         while index < count {
@@ -730,6 +1572,12 @@ impl App {
                         ch.text_len(),
                         ch.line_count(),
                     );
+                    if std::env::var_os("OMAREAD_DEBUG_TIME").is_some() {
+                        eprintln!(
+                            "TIME chapter {index} load+paginate: {:.0}ms",
+                            started.elapsed().as_secs_f32() * 1000.0
+                        );
+                    }
                     self.chapter = Some(ch);
                     self.index = index;
                     self.page = if backwards { self.last_page_of_loaded() } else { 0 };
@@ -810,6 +1658,17 @@ impl App {
                 let last = doc.pages.count().saturating_sub(1);
                 self.page = self.page.min(last);
             }
+            // Re-paginating in place moves the page boundaries, so a resize can
+            // put cards on screen that this document was never given covers for
+            // — the newly revealed row came up bare. Rebuild when the set of
+            // visible cards actually changes, which during a drag is a handful
+            // of times rather than every pixel.
+            if self.view == View::Library {
+                let now = self.lib_doc.as_ref().map(|d| visible_cards(d, self.page));
+                if now.is_some_and(|now| now != self.lib_covers) {
+                    self.lib_doc = None;
+                }
+            }
             return;
         }
         let vp = self.viewport();
@@ -862,6 +1721,7 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        let started = Instant::now();
         let (w, h) = self.size;
         let scale = self.scale as f64;
         let page = self.page;
@@ -876,12 +1736,42 @@ impl App {
         };
 
         match self.view {
-            View::Library if self.lib_doc.is_none() => self.build_library(),
+            // A different page shows different cards, and only the cards on the
+            // page carry covers.
+            View::Library if self.lib_doc.is_none() || self.page != self.lib_page => {
+                self.build_library()
+            }
             View::Toc if self.toc_doc.is_none() => self.build_toc(),
             View::Reading if self.hud_shown => self.build_hud(),
             _ => {}
         }
         let showing_hud = self.hud_shown && self.view == View::Reading;
+        let cols = self.effective_columns();
+        // Both borrow self immutably, so they cannot wait until after the
+        // disjoint-field destructure below.
+        let (highlights, selection) = match self.view {
+            View::Reading => (self.highlight_rects(), self.selection_rects()),
+            _ => (Vec::new(), Vec::new()),
+        };
+        // The library's selection is painted, so arrow keys cost a frame instead
+        // of a rebuild — a rebuild re-requests every cover.
+        let card_rect = |index: usize| -> Option<(f32, f32, f32, f32)> {
+            let doc = self.lib_doc.as_ref()?;
+            let node = find_by_attr(doc.dom(), 0, "data-index", &index.to_string())?;
+            chapter::node_rect(doc.dom(), node)
+        };
+        let (selected_card, hovered_card) = match self.view {
+            View::Library => (
+                card_rect(self.selected),
+                self.hover_card.filter(|i| Some(*i) != Some(self.selected)).and_then(card_rect),
+            ),
+            _ => (None, None),
+        };
+        let icons = match showing_hud {
+            true => self.hud_icons(),
+            false => Vec::new(),
+        };
+        let ink = parse_hex(&self.chrome().1);
 
         // Disjoint field borrows: `render` takes the renderer mutably, the
         // closure needs the document mutably to set the page offset. That rules
@@ -895,15 +1785,24 @@ impl App {
         }) else {
             return;
         };
-        let top = ch.pages.top_of(page);
-        let extent = ch.pages.extent_of(page);
         if std::env::var_os("OMAREAD_DEBUG_PAINT").is_some() {
             eprintln!(
-                "PAINT page {}/{} top={top:.0} page_h={page_h:.0} margin={margin:.0} win={w}x{h}",
+                "PAINT page {}/{} cols={cols} top={:.0} page_h={page_h:.0} win={w}x{h}",
                 page + 1,
-                ch.pages.count()
+                ch.pages.count(),
+                ch.pages.top_of(page),
             );
         }
+        let count = ch.pages.count();
+        // Read the flow slices before borrowing the document mutably: each
+        // column is a different page of the same flow.
+        let slices: Vec<(f32, f32)> = (0..cols)
+            .map(|c| page + c)
+            .map(|p| match p < count {
+                true => (ch.pages.top_of(p), ch.pages.extent_of(p)),
+                false => (0.0, 0.0),
+            })
+            .collect();
         let doc = &mut ch.doc;
         let frame = paint::Frame {
             width: w,
@@ -912,16 +1811,63 @@ impl App {
             margin,
             page_height: page_h,
         };
+        let col_w = (w as f32 / scale as f32) / cols as f32;
 
         renderer.render(|scene| {
             // An engine panic while painting must not take the window with it.
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                paint::page(scene, doc, top, extent, &frame, ground);
+                // Two columns are two pages of one flow side by side, not CSS
+                // multicol: the same document painted twice at two scroll
+                // offsets (CONTEXT.md §3).
+                for (col, &(top, extent)) in slices.iter().enumerate() {
+                    let x = col as f32 * col_w;
+                    if page + col >= count {
+                        // Past the end of the chapter: clean paper, not whatever
+                        // the previous frame left there.
+                        paint::column(scene, doc, 0.0, 0.0, x, col_w, &frame, ground, col == 0);
+                        continue;
+                    }
+                    paint::column(scene, doc, top, extent, x, col_w, &frame, ground, col == 0);
+                    paint::bands(scene, &highlights, HIGHLIGHT, top, extent, x, &frame);
+                    paint::bands(scene, &selection, SELECTION, top, extent, x, &frame);
+                }
+                // A wash under the pointer, before the outline, so a card that
+                // is both hovered and selected still reads as selected.
+                if let Some((cx, cy, cw, chh)) = hovered_card {
+                    let (top, extent) = slices.first().copied().unwrap_or((0.0, 0.0));
+                    paint::bands(
+                        scene,
+                        &[(cx, cy, cx + cw, cy + chh)],
+                        CARD_HOVER,
+                        top,
+                        extent,
+                        0.0,
+                        &frame,
+                    );
+                }
+                if let Some((cx, cy, cw, chh)) = selected_card {
+                    // Flow -> screen: the grid is a page like any other.
+                    let (top, _) = slices.first().copied().unwrap_or((0.0, 0.0));
+                    paint::outline(
+                        scene,
+                        (cx, cy - top + margin, cw, chh),
+                        CARD_OUTLINE,
+                        2.0,
+                        scale,
+                    );
+                }
                 if let Some(hud) = hud {
                     paint::overlay(scene, &mut hud.doc, &frame);
+                    for &(icon, rect) in &icons {
+                        paint::icon(scene, icon, rect, ink, scale);
+                    }
                 }
             }));
         });
+
+        if std::env::var_os("OMAREAD_DEBUG_TIME").is_some() {
+            eprintln!("TIME frame: {:.1}ms", started.elapsed().as_secs_f32() * 1000.0);
+        }
     }
 
     fn on_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
@@ -934,6 +1880,36 @@ impl App {
 
     fn library_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
         let cols = self.cards_per_row();
+
+        // While a tag is being typed every letter is tag text, so this runs
+        // before the search-and-navigate keys below.
+        if self.tagging.is_some() {
+            match key {
+                Key::Named(NamedKey::Escape) => self.tagging = None,
+                Key::Named(NamedKey::Enter) => self.apply_tag(),
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(t) = self.tagging.as_mut() {
+                        t.pop();
+                    }
+                }
+                Key::Character(c) => {
+                    if let Some(t) = self.tagging.as_mut() {
+                        t.push_str(c.as_str());
+                    }
+                }
+                Key::Named(NamedKey::Space) => {
+                    if let Some(t) = self.tagging.as_mut() {
+                        t.push('-');
+                    }
+                }
+                _ => return,
+            }
+            self.suggestions = self.completions();
+            self.lib_doc = None;
+            self.request_redraw();
+            return;
+        }
+
         match key {
             Key::Named(NamedKey::Escape) => {
                 if self.query.is_empty() {
@@ -951,10 +1927,11 @@ impl App {
                 self.query.pop();
                 self.reload_rows();
             }
-            Key::Named(NamedKey::ArrowRight) => self.move_selection(1),
-            Key::Named(NamedKey::ArrowLeft) => self.move_selection(-1),
-            Key::Named(NamedKey::ArrowDown) => self.move_selection(cols),
-            Key::Named(NamedKey::ArrowUp) => self.move_selection(-cols),
+            // Moving the selection paints; it does not rebuild.
+            Key::Named(NamedKey::ArrowRight) => return self.move_selection(1),
+            Key::Named(NamedKey::ArrowLeft) => return self.move_selection(-1),
+            Key::Named(NamedKey::ArrowDown) => return self.move_selection(cols),
+            Key::Named(NamedKey::ArrowUp) => return self.move_selection(-cols),
             Key::Named(NamedKey::PageDown) => self.turn_view(true),
             Key::Named(NamedKey::PageUp) => self.turn_view(false),
             Key::Named(NamedKey::Space) => {
@@ -974,6 +1951,12 @@ impl App {
                 self.reload_rows();
             }
             Key::Named(NamedKey::F5) => self.rescan(),
+            // A modifier-free key that is not a letter, for the same reason
+            // sort and rescan are: letters go to the search box.
+            Key::Named(NamedKey::F2) if !self.rows.is_empty() => {
+                self.tagging = Some(String::new());
+                self.suggestions = self.completions();
+            }
             Key::Character(c) => {
                 self.query.push_str(c.as_str());
                 self.reload_rows();
@@ -982,6 +1965,18 @@ impl App {
         }
         self.lib_doc = None;
         self.request_redraw();
+    }
+
+    /// The library card under the pointer, if any.
+    fn card_under_pointer(&self) -> Option<usize> {
+        if self.view != View::Library {
+            return None;
+        }
+        let doc = self.lib_doc.as_ref()?;
+        let x = self.cursor.0 / self.scale;
+        let y = self.cursor.1 / self.scale - self.page_margin() + doc.pages.top_of(self.page);
+        let hit = doc.doc.hit(x, y)?;
+        ancestor_attr(doc.dom(), hit.node_id, "data-index")?.parse().ok()
     }
 
     /// Open whatever is under the pointer. Coordinates are in CSS px relative
@@ -998,6 +1993,14 @@ impl App {
         let Some(hit) = doc.doc.hit(x, y) else { return };
         match self.view {
             View::Library => {
+                // A suggestion is a click target too; check it first, since a
+                // card and a suggestion are both just boxes in this document.
+                if let Some(text) = ancestor_attr(doc.dom(), hit.node_id, "data-suggest") {
+                    self.query = text;
+                    self.reload_rows();
+                    self.request_redraw();
+                    return;
+                }
                 let Some(hash) = ancestor_attr(doc.dom(), hit.node_id, "data-hash") else {
                     return;
                 };
@@ -1018,12 +2021,9 @@ impl App {
     }
 
     fn cards_per_row(&self) -> isize {
-        // Cards are border-box, so the pitch is card width plus one gap; the
-        // last card in a row needs no gap, hence the + GAP before dividing.
-        const CARD: f32 = 150.0;
-        const GAP: f32 = 30.0;
-        let usable = (self.size.0 as f32 / self.scale) - 56.0;
-        (((usable + GAP) / (CARD + GAP)).floor() as isize).max(1)
+        // The grid owns its own geometry; a second copy of these numbers here is
+        // how arrow keys start stepping onto columns that do not exist.
+        grid::per_row(self.size.0 as f32 / self.scale) as isize
     }
 
     fn move_selection(&mut self, by: isize) {
@@ -1036,6 +2036,7 @@ impl App {
         if let Some(page) = self.lib_doc.as_ref().and_then(|d| page_of_index(d, self.selected)) {
             self.page = page;
         }
+        self.request_redraw();
     }
 
     fn rescan(&mut self) {
@@ -1067,14 +2068,14 @@ impl App {
                 "l" => self.to_library(),
                 "/" => {
                     self.find.clear();
-                    self.finding = true;
+                    self.toc_mode = TocMode::Search;
                     self.open_toc();
                 }
-                "c" => {
-                    println!(
-                        "omaread: two-column is not paintable yet (blitz-paint resets the scene)"
-                    );
-                }
+                "m" => self.open_marks(),
+                "b" => self.toggle_bookmark(),
+                "h" => self.highlight_selection(),
+                "y" => self.copy_selection(),
+                "c" => self.toggle_columns(),
                 "t" => {
                     self.style.theme = match self.style.theme {
                         Theme::White => Theme::Sepia,
@@ -1085,16 +2086,8 @@ impl App {
                     println!("omaread: theme {:?}", self.style.theme);
                     self.restyle();
                 }
-                "+" | "=" => {
-                    self.style.scale = (self.style.scale + 0.1).min(1.6);
-                    println!("omaread: {:.0}px", self.style.font_px());
-                    self.restyle();
-                }
-                "-" => {
-                    self.style.scale = (self.style.scale - 0.1).max(0.8);
-                    println!("omaread: {:.0}px", self.style.font_px());
-                    self.restyle();
-                }
+                "+" | "=" => self.set_font_scale(self.style.scale + 0.1),
+                "-" => self.set_font_scale(self.style.scale - 0.1),
                 _ => {}
             },
             _ => {}
@@ -1107,7 +2100,10 @@ impl App {
         match key {
             Key::Named(NamedKey::Escape) => {
                 // Esc backs out one step: query first, then the view.
-                if self.finding && !self.find.is_empty() {
+                if self.noting.is_some() {
+                    self.noting = None;
+                    self.note.clear();
+                } else if self.toc_mode == TocMode::Search && !self.find.is_empty() {
                     self.find.clear();
                 } else {
                     self.close_toc();
@@ -1118,24 +2114,48 @@ impl App {
                 self.close_toc();
                 return;
             }
-            Key::Named(NamedKey::Backspace) if self.finding => {
+            Key::Named(NamedKey::Backspace) if self.noting.is_some() => {
+                self.note.pop();
+            }
+            Key::Named(NamedKey::Space) if self.noting.is_some() => self.note.push(' '),
+            Key::Character(c) if self.noting.is_some() => self.note.push_str(c.as_str()),
+            Key::Named(NamedKey::Backspace) if self.toc_mode == TocMode::Search => {
                 self.find.pop();
                 self.toc_sel = 0;
             }
-            Key::Named(NamedKey::Space) if self.finding => {
+            Key::Named(NamedKey::Space) if self.toc_mode == TocMode::Search => {
                 self.find.push(' ');
                 self.toc_sel = 0;
             }
             // While searching every letter is query text, so the single-key
             // commands below are unreachable — which is what you want when you
             // are typing a word that happens to contain "q".
-            Key::Character(c) if self.finding => {
+            Key::Character(c) if self.toc_mode == TocMode::Search => {
                 self.find.push_str(c.as_str());
                 self.toc_sel = 0;
             }
+            // Marks mode has room for commands, because nothing is being typed.
+            Key::Character(c) if self.toc_mode == TocMode::Marks => match c.as_str() {
+                "n" => self.begin_note(),
+                "x" => self.delete_mark(),
+                "q" => {
+                    self.save_position();
+                    event_loop.exit();
+                    return;
+                }
+                "l" => {
+                    self.to_library();
+                    return;
+                }
+                _ => return,
+            },
             Key::Named(NamedKey::Enter) => {
-                self.open_toc_entry(self.toc_sel);
-                return;
+                if self.noting.is_some() {
+                    self.save_note();
+                } else {
+                    self.open_toc_entry(self.toc_sel);
+                    return;
+                }
             }
             Key::Named(NamedKey::ArrowDown) => self.move_toc_selection(1),
             Key::Named(NamedKey::ArrowUp) => self.move_toc_selection(-1),
@@ -1166,6 +2186,21 @@ impl App {
         // The selection is baked into the markup, so moving it rebuilds.
         self.toc_doc = None;
         self.request_redraw();
+    }
+}
+
+/// Which cards sit on `page`, from a laid-out grid.
+fn visible_cards(doc: &Chapter, page: usize) -> std::ops::Range<usize> {
+    let top = doc.pages.top_of(page);
+    let bottom = top + doc.pages.extent_of(page);
+    let on_page: Vec<usize> = chapter::indexed_tops(doc.dom())
+        .into_iter()
+        .filter(|&(_, y)| y >= top - 1.0 && y < bottom)
+        .map(|(i, _)| i)
+        .collect();
+    match (on_page.first(), on_page.last()) {
+        (Some(&a), Some(&b)) => a..b + 1,
+        _ => 0..0,
     }
 }
 
@@ -1252,6 +2287,13 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
+            // The pointer left, so nothing is under it.
+            WindowEvent::CursorLeft { .. } => {
+                if self.hover_card.take().is_some() {
+                    self.request_redraw();
+                }
+            }
+
             WindowEvent::CloseRequested => {
                 self.save_position();
                 event_loop.exit();
@@ -1268,15 +2310,42 @@ impl ApplicationHandler for App {
                 let moved = self.cursor != (position.x as f32, position.y as f32);
                 self.cursor = (position.x as f32, position.y as f32);
                 if moved {
+                    if self.dragging {
+                        self.extend_selection();
+                    }
+                    // Repaint only when the card under the pointer changes, not
+                    // on every motion event.
+                    let over = self.card_under_pointer();
+                    if over != self.hover_card {
+                        self.hover_card = over;
+                        self.request_redraw();
+                    }
                     self.poke_hud();
                 }
             }
 
             WindowEvent::MouseInput { state, button, .. }
-                if state == ElementState::Pressed
-                    && button == winit::event::MouseButton::Left =>
+                if button == winit::event::MouseButton::Left =>
             {
-                self.on_click();
+                match state {
+                    // In the page, a press anchors a selection; in the library
+                    // and the contents it opens whatever is under the pointer.
+                    ElementState::Pressed if self.view == View::Reading => {
+                        // The HUD is on top of the page, so it gets the click.
+                        if !self.hud_action() {
+                            self.begin_selection();
+                        }
+                    }
+                    ElementState::Pressed => self.on_click(),
+                    ElementState::Released => {
+                        self.dragging = false;
+                        // A press with no drag is a click, not a selection.
+                        if self.sel.as_ref().is_some_and(|(_, s)| s.is_collapsed()) {
+                            self.sel = None;
+                            self.request_redraw();
+                        }
+                    }
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1285,7 +2354,12 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => -p.y as f32,
                 };
                 if dy.abs() > 0.5 {
-                    self.turn(dy > 0.0);
+                    // The reading turn crosses chapters and saves a position;
+                    // the library and the contents just page their document.
+                    match self.view {
+                        View::Reading => self.turn(dy > 0.0),
+                        _ => self.turn_view(dy > 0.0),
+                    }
                 }
             }
 
@@ -1301,6 +2375,16 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_resources();
+
+        if let Some(at) = self.exit_at {
+            if Instant::now() >= at {
+                self.save_position();
+                event_loop.exit();
+                return;
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            return;
+        }
 
         // The HUD is the only thing here that happens without an event, so it is
         // the only reason to ask the loop to wake on a clock.

@@ -34,7 +34,8 @@ pub fn html(
     };
 
     format!(
-        r#"<html><body>
+        r#"<!DOCTYPE html>
+<html><body>
 <div class="bar">
   <span class="title">{heading}</span>
   <span class="meta">{subtitle}</span>
@@ -113,7 +114,7 @@ mod tests {
     use super::*;
 
     fn entry(label: &str, depth: usize, spine: usize) -> TocEntry {
-        TocEntry { label: label.into(), depth, spine, fragment: None, find: None }
+        TocEntry { label: label.into(), depth, spine, fragment: None, find: None, cfi: None }
     }
 
     /// Labels come out of files off the internet, exactly like book metadata in

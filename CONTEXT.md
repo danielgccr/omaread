@@ -131,6 +131,9 @@ Three: **theme, font size, columns (1 or 2).** Plus the invisible-chrome toggle,
 which is a gesture rather than a setting. Resist adding more; every knob is a
 combination that has to look good.
 
+All three are reachable from the HUD as well as from the keyboard (§8). **Font
+size is stored globally**, not per book: it describes the reader, not the book.
+
 ### Pagination
 
 Taffy implements Flexbox, Grid and block layout. **It has no multi-column and no
@@ -176,7 +179,7 @@ One database. Holds:
 
 - book metadata, cover images as BLOB
 - reading progress (CFI), bookmarks, highlights, notes
-- collections / tags
+- collections / tags (one `tags` table; a collection *is* a tag)
 - **FTS5 over extracted chapter text** (built in Phase 6: ~400MB for 360 books,
   indexed on open or via `omaread --index`)
 
@@ -238,6 +241,40 @@ when; that data must not be able to leave.
 This is not hypothetical. See §8 — real books from the test library panicked
 `blitz-dom` twice within minutes of first contact.
 
+### Exit does not run destructors
+
+`main` ends with `std::process::exit(0)`, deliberately.
+
+**Every clean exit dumped core.** Dropping the renderer tears down wgpu's
+GLES/EGL instance — a backend this app never renders with, which exists only
+because wgpu enumerates all of them — and NVIDIA's egl-wayland layer then
+marshals a Wayland request on a dead proxy:
+
+```
+wl_proxy_marshal_flags            libwayland-client   <- SIGSEGV
+libnvidia-egl-wayland2 / libEGL_nvidia
+<wgpu_hal::gles::egl::Inner as Drop>::drop
+drop_glue<VelloWindowRenderer>
+drop_glue<App>                    <- end of main
+```
+
+Ten cores on this machine before it was looked at, every one the same stack.
+
+Two fixes were tried and rejected as insufficient before this one: releasing the
+surface via `WindowRenderer::suspend()` in winit's `exiting` hook (the crash is
+in the *instance*, not the surface), and the observation that `App` dropped
+`window` before `renderer` (true, and worth knowing, but not the cause). Only
+skipping the teardown works.
+
+Nothing here needs a destructor to be correct: reading position, marks and tags
+are committed to SQLite before the loop returns, and WAL means a process that
+simply stops loses nothing. The OS reclaims the GPU and the fonts. Remove the
+`exit` when wgpu or the driver can survive its own teardown.
+
+`OMAREAD_EXIT_AFTER=<ms>` exists because of this: shutdown is a real code path
+with real bugs in it, and it could not be reached from a script without a window
+manager. It is the same path `q`, Esc and the compositor's close button all take.
+
 ## 7. Scope of 1.0 (Full)
 
 Library grid, search, sort · reading with pagination, themes, font size · TOC
@@ -280,8 +317,8 @@ page number.
 chapter, paginates, and reports engine panics, breaks that cut an atom, stalls
 and empty chapters. This is the CI harness §13 asks for.
 
-**Two-column is specified and paginated but not yet paintable** — see the
-`paint_scene` reset note below.
+**Two-column paints** as of Phase 8 — see below. The paginator supported it from
+here; only the compositing was missing.
 
 **Phase 3 complete** — CFI and persistence. `src/cfi.rs` generates, parses and
 resolves the structural CFI subset (`epubcfi(/6/N!/4/2/6)`, optional `:offset`
@@ -310,6 +347,22 @@ pattern as the book provider.
 
 Measured on the real library: **372 files, 361 unique books** (11 collapsed by
 content hash — the same titles sitting in two folders), **358 with covers**.
+
+Cards are 225×348 with 21px titles and 18px authors — a 1.5× enlargement of the
+first sizing, geometry and caption alike, which was too small to read a spine at
+arm's length — and **a row holds at most seven** however wide
+the window gets: past seven, a shelf of covers turns into a contact sheet. The
+grid is capped at that width and centred, so a 4K screen gets a shelf rather than
+a wall. The cap lives in `grid.rs` as one number with one piece of arithmetic
+(`grid::per_row`) that both the stylesheet and arrow-key navigation use; a second
+copy in `main.rs` is exactly how the selection starts stepping onto columns that
+are not there.
+
+The card under the pointer takes a light blue wash, and the selected card an
+outline. Both are painted rather than marked up, for the same reason: a `:hover`
+class would mean rebuilding the document on every mouse move, and a rebuild
+re-requests covers. The wash is drawn through `paint::bands`, the same call the
+reading highlights use, so hover cost nothing but a colour and a rect.
 
 Type to search, Tab to change sort, F5 to rescan, Enter or click to open, Esc or
 `l` to come back. Book metadata is escaped on the way into the markup and there
@@ -446,6 +499,21 @@ phrase straddles an inline tag.
 *Typing in the library now searches the pages too*, off the same index, for the
 cost of one `OR` and a subquery.
 
+*The library has a search field at the right of its bar*, showing the query and
+a caret, with up to six completions under it. Not an `<input>`: keystrokes
+already arrive through the window and the field only has to show the query, so a
+focus and editing model for one box would be pure cost. The completions are
+FTS5's own term list (`fts5vocab`), ranked by how many chapters use the word —
+so they are real words from the shelf, in the folded form you would type
+("histerica", not "histérica"). Author names are mixed in, because a library
+where nothing has been indexed yet would otherwise never suggest anything. They
+are clickable, through the same hit-testing the cards use. Suggestions render
+only while there is a query, so the grid shifts down once rather than twitching
+on every keystroke.
+
+`omaread --shot library <out.ppm> [query]` renders the library through the same
+paint path, which is how the above was checked.
+
 **Measured on the real library:** `--index` indexed **359 books, 19626 chapter
 rows, in 14 seconds**. The database is **406MB** — which is why nothing indexes
 the whole library on its own: opening a book indexes that book (cheap, and it is
@@ -455,8 +523,179 @@ following the accent-free query "tipografia siempre estaba" lands on page 7 of
 ch.10 of Postman, on the line "la resonancia de la tipografía siempre estaba
 presente".
 
-Next: Phase 7, bookmarks, highlights and notes — the first thing that needs
-sub-paragraph CFI precision (§4).
+**Phase 7 complete** — bookmarks, highlights, notes, selection and copy.
+
+*Sub-paragraph CFI, at last.* `Cfi` already parsed and printed `:offset`; Phase 7
+is what generates one. Offsets are stored as **characters**, not bytes, because
+that is what `:offset` means and because folding an accent changes a byte length
+but never a character count. parley counts bytes, so the conversion happens at
+that boundary and nowhere else.
+
+*Selection is parley's.* `Cursor`/`Selection` do hit-testing, extension and
+selection geometry; parley is already pinned by blitz-dom, so naming it directly
+cost one line of `Cargo.toml` and no new code. A press anchors, a drag extends, a
+press with no drag is a click and clears. **One paragraph at a time** — a
+selection lives in one parley layout, and stitching several is a bigger job than
+it looks; a drag past the end clamps to the paragraph rather than doing nothing.
+
+*Bookmarks and highlights are one table.* A bookmark is a highlight with no span,
+so `marks` holds both: CFI, length in characters, the words themselves, and a
+note. `UNIQUE(file_hash, cfi, length)` is what makes `b` a toggle rather than a
+duplicate factory. The list comes back in reading order — by spine and offset,
+because CFIs only sort correctly as text by accident.
+
+*The marks list is the contents view*, again. Contents, search hits and marks are
+all "places in this book", so the `finding` bool became a `TocMode` and all three
+share one document, one key handler and one hit-test path. An entry now carries a
+`fragment`, a `find`, **or** a `cfi`, and following it uses whichever it has.
+
+*Painting.* Highlights and the selection are flow-coordinate rectangles filled
+after the page, clipped to the page band so a highlight belonging to the next
+page cannot bleed into this one's margin. On top of the glyphs, translucent —
+which is what a highlighter does.
+
+*Copy* shells out to `wl-copy`. Wayland is the target (§1), so that is one
+process instead of one dependency; it says so plainly if wl-clipboard is missing.
+
+*Notes* are typed in the marks list (`n`), which reuses the same typing mode the
+search box uses.
+
+Verified by rendering: `--shot` given text instead of a page number now also
+highlights it, and the result puts a yellow band across exactly "resonancia de la
+tipografía siempre estaba presente", correctly split per line, from an
+accent-free query — the same `highlight_rects` path a stored mark paints through.
+
+Keys: `b` bookmark · drag to select · `h` highlight · `y` copy · `m` marks, then
+`n` note and `x` delete.
+
+**Phase 8, two-column** — the last of §3's three user-facing controls, and the
+one that had never worked. `c` toggles it.
+
+Two columns are two pages of one flow side by side: the document is laid out at
+*column* width and painted twice, at two scroll offsets, the second through
+`paint::Compose` with an x translation. Not CSS multicol, which Taffy does not
+have, and better for a reader anyway — the columns are pages you turn, not a
+scroll that snakes.
+
+What the implementation actually turned on:
+
+- **`Compose` grew a transform.** The Phase 7 wrapper already swallowed
+  `reset`; pre-multiplying an `Affine` into every forwarded drawing command is
+  what moves the content. §9's warning that a layer transform moves the clip and
+  not the content is still true — this is not a layer.
+- **Masks are per column, not per frame.** Two columns are two pages, and a
+  break lands where it lands: their extents differ by up to a line, so one
+  full-width band would clip the longer column or leak the shorter one's next
+  line.
+- **The document is painted at column width**, so its own background stays
+  inside its column.
+- **A ragged end is clean paper.** Past the last page a column gets ground
+  rather than whatever the previous frame left there.
+- **The pointer knows its column.** A selection in the right-hand column belongs
+  to a different page of the flow, so the column under the pointer decides both
+  the vertical offset and the x.
+- **The HUD spans the window**, not a column: only the page is laid out narrow.
+- **One column outside the reading view.** The library and the contents are
+  single documents at window width; that decision now lives in one pure function
+  (`columns_for`) with the width test §3 asks for.
+
+Verified by rendering at 1800×1000: the left column ends "…A veces tiene el
+poder" and the right begins "de implicarse en nuestros conceptos de piedad…" —
+continuous, no gap, no repeat — and on the last page the right column is blank
+paper with the HUD across the foot.
+
+**Collections and tags** — §7 lists both; they are **one mechanism**. A
+collection is a named group of books and so is a tag, so there is one `tags`
+table, one filter and one gesture rather than two of each. Presented as tags,
+because that is the word that also covers "a book in two collections".
+
+- **`#tag` in the search box filters by tag.** No new view, no new mode: the box
+  that already exists gains a prefix, and the suggestions under it turn into the
+  tags in use with their book counts.
+- **F2 tags the selected book**, borrowing the same box to type into. A
+  modifier-free non-letter key, for the reason the codebase already gives for
+  Tab and F5: letters go to the search box.
+- **One key, both directions.** Typing a tag the book already has removes it. A
+  separate "untag" would need its own key *and* its own way to name the tag.
+- **Tags are folded and hyphenated on the way in**, so "Sci Fi", "sci-fi" and
+  "SCI-FI" are one group and an accent does not split one either — the same
+  `search::fold` the index and the highlights use.
+- Rows carry their tags from **one** query, not one per book; the cards show them
+  under the author.
+
+Verified by rendering: `#ensayo` in the box, "4 matching “#ensayo”" in the bar,
+and the tag under the author on the cards.
+
+**The HUD became the reading chrome.** It had one bar; it now has two, and both
+are click targets.
+
+- **Top bar:** Bookmark, Contents, Highlight on the left; `A−`, `A+` and the
+  column toggle on the right. Every one of §3's three controls is now reachable
+  by mouse as well as by key, which is what makes the keys optional rather than
+  required knowledge.
+- **Bottom bar:** the book's title, in **semibold** — it is the book, so it
+  carries the weight — and a readout that **toggles between the percentage and
+  the page number on a single click**.
+- Both bars sit in the page's own margins, so nothing covers prose. Buttons carry
+  `data-hud`, and a press in the reading view asks the HUD first: only if the
+  pointer missed it does the page start a selection.
+- There is a test that every control is *hittable*, not merely drawn — it scans
+  across both bars and asserts each `data-hud` occupies real window coordinates.
+  Rendering a button and being able to click it are different claims.
+
+**Font size is universal.** It is a property of the reader's eyes, not of the
+book, so it is stored once in `~/.config/omaread/settings.txt` and applies to
+every book from then on. `folders.txt` said to add a real config format when
+there was a second thing to configure; this is it, and it is `key=value` lines
+hand-parsed in twelve lines rather than a TOML dependency. Writing one setting
+leaves the others alone, and there is a test for that, because a font-size change
+silently dropping another setting is exactly the bug that format invites.
+
+Verified: `font-scale=1.40` on disk gives a 924px measure at startup (28px × 33em)
+where the default gives 660px.
+
+**Icons are painted, not typeset.** The bundled faces carry no symbol glyphs —
+checked, not assumed: no ☰, no ⚑, no ✎ in Literata, Charis SIL or IBM Plex Mono,
+and a missing glyph is visible tofu. So the HUD reserves an empty box per control
+and the window fills it with a kurbo path (`paint::Icon`): a pennant, three
+rules, a marker, a back triangle. No font, no SVG plumbing, no asset, and it
+takes the chrome's own colour.
+
+Two things this turned up:
+
+- **SVG only arrives as an image.** `svg` is a default feature of blitz-dom and
+  blitz-paint, but inline `<svg>` markup is not parsed into a tree — SVG reaches
+  a document as `Resource::Svg` through the net provider. Icons that way would
+  mean an origin, a provider, async delivery and routing it to the HUD document.
+- **An inline-block inside text has no Taffy box.** The first attempt reserved
+  space correctly and painted nothing: `final_layout.size` was 0×0, because an
+  inline-level box inside an inline formatting context lives in the parley layout
+  as an inline box. Making each button `display: flex` gives the slot a real box.
+  Worth remembering the next time something is laid out but unpaintable.
+
+**Page numbers span the book, and are measured rather than estimated.** Two
+estimates were built and both thrown away: chapter page counts alone put the same
+book at 342 then 764 pages as you moved through it, and switching to *fractional*
+pages (to stop a 200-byte chapter claiming a whole one) only moved the swing to
+76–342. One chapter's density does not predict a 131-item spine where many items
+are a paragraph long.
+
+So `chapter::page_counts` lays out every chapter once — three seconds for that
+book, images included, since they change how much fits — and the result is cached
+in `pagination`, keyed by book *and* layout, because a page count means nothing
+without a font size and a column width. It runs from the click that asks for page
+numbers, never from a redraw. At a layout that has not been measured the readout
+falls back to the chapter's own numbering, which is true, rather than an estimate
+that is not. Stable at 393 pages from chapters 8, 60 and 120 of the same book.
+
+**Removing a highlight is in the menu.** A press inside a stored highlight
+remembers it, and the Highlight control becomes Remove — the useful offer once
+the pointer is already inside one. `x` in the marks list still works.
+
+**The bottom bar opens with a Library button**, back arrow first, then the title.
+
+Next: AZW3/MOBI import and AccessKit — the last two items of §7. MOBI is the only
+one needing a converter, so it is the odd one out and probably last.
 
 ## 9. Spike findings (verified, not assumed)
 
@@ -506,6 +745,24 @@ Mitigations, both of which were already the design:
 Malformed HTML (`ERROR: Duplicate attribute` in the Géron book) is reported and
 recovered from without panicking.
 
+**`align-items: baseline` puts a flex container's buttons at different heights.**
+A flex container takes its baseline from its first item, and for the HUD buttons
+carrying an icon that is an *empty* 11px box — so those sat a few pixels above
+the plain-text ones and the two ends of the bar did not line up. `center` does
+not consult baselines and does not care.
+
+**A document with no doctype costs one `ERROR: Unexpected token` per parse.**
+html5ever's tree builder calls `unexpected()` for the first tag in the Initial
+insertion mode, and blitz-html prints every parse error with a bare `println!` —
+to stdout, from inside the dependency, with no switch. The books were innocent:
+their XHTML carries a doctype and parses silently. The noise was ours, and the
+HUD generated most of it, because it is rebuilt on every page turn.
+
+Every document Omaread authors now starts `<!DOCTYPE html>`, and there is a test
+that says so for all three. Reading a book prints nothing; so does the library.
+Layout is unchanged, because blitz builds its stylist with
+`QuirksMode::NoQuirks` whatever the parser decided.
+
 **`DocumentConfig` exposes exactly the hooks the design needs:** `ua_stylesheets`
 for the base stylesheet, `net_provider` for the hermetic resource provider,
 `base_url` for in-zip resolution, `font_ctx` for bundled fonts.
@@ -533,10 +790,13 @@ public and implementable, so a wrapper that forwards every method and makes
 erasing it. `paint::NoReset` is that wrapper, about forty lines of forwarding,
 and the reading HUD is painted through it.
 
-This retires the second half of the `paint_scene` note above. **Two-column is no
-longer blocked on upstream** — it needs the same wrapper and a per-column
-`set_viewport_scroll`, not a new blitz release. Painting the page ground and
-masks after the call is still required.
+This retires the second half of the `paint_scene` note above, and **two-column
+never needed an upstream release** — only this wrapper. Painting the page ground
+and masks after the call is still required.
+
+A *layer* transform moves the clip shape and not the content (below), but a
+transform pre-multiplied into every drawing command does move the content, which
+is what puts the second column on the right-hand side.
 
 **A page is shorter than the page height, and the mask has to know it.** Breaks
 snap *up* to an atom boundary, so a page ends short of its nominal height — 872
@@ -669,6 +929,83 @@ integration degrades to a sensible default elsewhere.
 - Hyphenation patterns for `en`/`es`/`ca` regardless of UI language. Unhyphenated
   justified Spanish produces rivers of whitespace; this is load-bearing for the
   aesthetic, not an i18n nicety.
+
+## 12b. Measured performance
+
+Numbers from this machine, release build, 372-book library. `OMAREAD_DEBUG_TIME=1`
+prints frame, chapter and grid timings; `OMAREAD_EXIT_AFTER=<ms>` makes
+start-to-ready measurable from a script.
+
+| | |
+|---|---|
+| Ready to read a book | **0.93–1.03s** |
+| Ready to the library | **1.05–1.09s** |
+| Frame (page turn within a chapter) | **1–5ms** |
+| Chapter load + paginate, prose | **23–42ms** |
+| Chapter load + paginate, Géron ch.9 (156 images) | **114ms** |
+| Full grid rebuild, 361 rows | **233–249ms** |
+
+Two things this found and fixed:
+
+- **The library rebuilt on every arrow key.** Selection was a `.selected` class
+  in the markup, so moving it rebuilt the document — which re-requests every
+  cover: 1781ms per keypress. The selection is now *painted* as an outline
+  (`paint::outline`), so arrows cost a frame. An outline also does not tint the
+  cover underneath. `data-index` stays in the markup because that is how the
+  window finds the card to outline.
+- **The first chapter was laid out twice at startup.** `open_path` loaded it at a
+  guessed window size, then `resumed` loaded it again at the real one. Skipped
+  when there is no window yet — 114ms off the start of an illustrated book.
+
+What the measurements say to leave alone: the reading view is fine. Frames are
+1–5ms even though highlights are re-queried from SQLite every frame, so that
+`ponytail:` note stays a note.
+
+**The library loaded 358 covers to show about fourteen.** Isolated by building
+the grid with the cover provider removed: **1817ms with covers, 91ms without** —
+95% of the cost, for images nobody could see.
+
+So the grid is built twice. The first pass carries no covers and exists only to
+find out which cards this page shows (`visible_cards`, off one walk collecting
+`data-index` tops — asking `find_by_attr` per card would be quadratic); the
+second gives those cards their covers. Everything off the page keeps the title
+jacket it already had for coverless books. A page turn rebuilds, because a
+different page shows different cards.
+
+**A card must be the same box whether or not it shows a cover.** Loading covers
+only for the visible page needs to know which cards are visible, which is decided
+by pagination — and a cover is an `<img>`, which `collect_atoms` makes an
+unbreakable block, while a missing cover used to be a text jacket, which a page
+break may fall inside. So the page fitted two rows of jackets where it fits one
+row of covers, the measuring pass disagreed with the real grid, and the grid
+rebuilt itself forever: 33 rebuilds and climbing.
+
+Every card now carries an `<img>`, with or without a `src`. The title jacket is
+gone; the title was always printed under the card anyway. The measuring pass uses
+the *same* markup as the real grid and simply has no provider to fetch through,
+so the two paginate identically and the answer is stable. Two rebuilds over eight
+seconds — the first build and the resize the compositor does after mapping — and
+then it settles.
+
+Two smaller things the same hunt turned up: `.card` had no `flex-shrink: 0`, and
+the mouse wheel called the *reading* page turn in every view, so scrolling the
+library crossed chapters and saved a reading position. There is now a test that
+lays the grid out at five window widths and asserts the row holds exactly what
+`grid::per_row` claims — the arithmetic and the stylesheet agreeing is the whole
+basis for arrow-key navigation, and asserting it against the arithmetic alone
+proves nothing.
+
+That is what the **Library button needing four presses** actually was. The click
+always worked: a press matched `data-hud="library"` first time. But
+`to_library()` then blocked the event loop for nearly two seconds with no
+repaint, so the presses that arrived meanwhile queued up and were delivered
+*after* the switch — in the library, where a click opens whatever card is under
+the pointer, putting you straight back in the book. Measure before believing a
+report about clicks.
+
+Still unfixed and now much smaller: covers are decoded at whatever size the
+publisher shipped. Downscaling at import (and §4's decoded LRU) would take the
+remaining ~140ms down again; noted at `net::CoverProvider`.
 
 ## 13. Testing
 

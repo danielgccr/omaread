@@ -54,6 +54,10 @@ impl<D: Send + Sync + 'static> NetProvider<D> for BookNetProvider<D> {
 
 /// Serves cover images to the library view straight out of SQLite. Same
 /// hermetic rule as the book provider: nothing but our own origin resolves.
+// ponytail: covers are served at whatever size the publisher shipped, so blitz
+// decodes a full-size JPEG per card and a full grid rebuild costs 1.8s for 361
+// books — about 1.5s of it decoding. Downscale at import (and cache the decoded
+// RGBA, §4's in-memory LRU) when that stops being only a rebuild cost.
 pub struct CoverProvider<D> {
     db: Arc<Mutex<Db>>,
     callback: SharedCallback<D>,

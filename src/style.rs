@@ -245,6 +245,56 @@ fn drop_spans(s: &str, open: &str, close: &str) -> String {
     out
 }
 
+/// User settings that outlive one book — currently the font size, which is a
+/// property of the reader's eyes, not of the book (§3 calls it one of three
+/// controls, and a control that forgets is not one).
+///
+/// ponytail: `key=value` lines, hand-parsed. `folders.txt` said to add a real
+/// config format when there was a second thing to configure; this is it, and it
+/// is twelve lines rather than a TOML dependency.
+fn settings_file() -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("omaread/settings.txt")
+}
+
+pub fn setting(key: &str) -> Option<String> {
+    setting_in(&settings_file(), key)
+}
+
+/// Write one setting, leaving the others alone.
+pub fn set_setting(key: &str, value: &str) {
+    set_setting_in(&settings_file(), key, value);
+}
+
+fn setting_in(path: &std::path::Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == key)
+        .map(|(_, v)| v.trim().to_string())
+}
+
+fn set_setting_in(path: &std::path::Path, key: &str, value: &str) {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = old
+        .lines()
+        .filter(|l| l.split_once('=').is_none_or(|(k, _)| k.trim() != key))
+        .map(str::to_string)
+        .collect();
+    lines.push(format!("{key}={value}"));
+
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Settings are a convenience; failing to save one must not stop anything.
+    if let Err(e) = std::fs::write(path, lines.join("\n") + "\n") {
+        eprintln!("omaread: could not save {key}: {e}");
+    }
+}
+
 /// App chrome as CSS colour strings: (background, foreground, subtle, panel).
 pub type Chrome = (String, String, String, String);
 
@@ -284,6 +334,29 @@ fn parse_chrome(css: &str) -> Option<Chrome> {
 
 #[cfg(test)]
 mod tests {
+    /// A setting has to survive being written next to another one, or changing
+    /// the font size would forget the watched folders' neighbours.
+    #[test]
+    fn settings_round_trip_without_clobbering_each_other() {
+        // Takes a path rather than setting XDG_CONFIG_HOME: mutating the
+        // environment would race every other test in the process.
+        let dir = std::env::temp_dir().join(format!("omaread-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.txt");
+
+        super::set_setting_in(&path, "font-scale", "1.2");
+        super::set_setting_in(&path, "something-else", "keep me");
+        super::set_setting_in(&path, "font-scale", "0.9");
+
+        assert_eq!(super::setting_in(&path, "font-scale").as_deref(), Some("0.9"));
+        assert_eq!(super::setting_in(&path, "something-else").as_deref(), Some("keep me"));
+        assert_eq!(super::setting_in(&path, "never-set"), None);
+        // A missing file is not an error, just no settings.
+        assert_eq!(super::setting_in(&dir.join("nope.txt"), "font-scale"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The rendered template is the whole Omarchy integration, so its parse is
     /// the thing that must not quietly do the wrong thing.
     #[test]

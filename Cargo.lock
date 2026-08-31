@@ -2265,6 +2265,7 @@ dependencies = [
  "fontique",
  "hyphenation",
  "kurbo 0.12.0",
+ "parley",
  "peniko",
  "rbook",
  "rusqlite",

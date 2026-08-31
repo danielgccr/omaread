@@ -26,6 +26,9 @@ impl NetCallback<Resource> for Discard {
 }
 
 pub fn run(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("library") {
+        return library_shot(&args[1..]);
+    }
     let [path, chapter_arg, page_arg, out, rest @ ..] = args else {
         eprintln!(
             "usage: omaread --shot <book.epub> <chapter> <page> <out.ppm> [hud] [theme]\n\
@@ -36,6 +39,14 @@ pub fn run(args: &[String]) -> i32 {
     };
 
     let (w, h) = size_from_env();
+    // Two columns are two pages of one flow, so the document is laid out at
+    // column width — exactly what the window does.
+    let cols: u32 = std::env::var("OMAREAD_SHOT_COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, 2);
+    let col_w = w / cols;
     let with_hud = rest.iter().any(|a| a == "hud");
     let theme = match rest.iter().find(|a| *a != "hud").map(String::as_str) {
         Some("sepia") => Theme::Sepia,
@@ -47,7 +58,7 @@ pub fn run(args: &[String]) -> i32 {
     let style = ReadingStyle { theme, ..ReadingStyle::default() };
     let margin = PAGE_MARGIN_EM * style.font_px();
     let page_height = (h as f32 - 2.0 * margin).max(1.0);
-    let make_viewport = || chapter::viewport(w, h, 1.0, theme == Theme::Night);
+    let make_viewport = || chapter::viewport(col_w, h, 1.0, theme == Theme::Night);
 
     let book = match Book::open(path) {
         Ok(b) => b,
@@ -80,6 +91,19 @@ pub fn run(args: &[String]) -> i32 {
             }),
     };
     let page = page.min(ch.pages.count().saturating_sub(1));
+
+    // Given text rather than a page number, highlight it too: that exercises the
+    // same geometry a stored highlight is painted with.
+    let highlights: Vec<(f32, f32, f32, f32)> = match page_arg.parse::<usize>() {
+        Ok(_) => Vec::new(),
+        Err(_) => chapter::node_containing_text(ch.dom(), page_arg)
+            .and_then(|node| {
+                let tl = chapter::text_layout(ch.dom(), node)?;
+                let (at, len) = crate::search::char_match(&tl.text, page_arg)?;
+                Some(chapter::highlight_rects(ch.dom(), node, at, len))
+            })
+            .unwrap_or_default(),
+    };
     let top = ch.pages.top_of(page);
 
     let mut hud_doc = with_hud
@@ -88,13 +112,29 @@ pub fn run(args: &[String]) -> i32 {
                 true => top / ch.pages.content_height,
                 false => 0.0,
             };
-            let percent = (book.progress(index, within) * 100.0).round() as u8;
+            // `pages` shows the whole-book page number instead, through the
+            // same arithmetic the window uses.
+            let readout = match rest.iter().any(|a| a == "pages") {
+                // Measures the whole book, the same way the window does when you
+                // ask it for page numbers.
+                true => {
+                    let counts = chapter::page_counts(
+                        &book, &style, None, col_w, h, 1.0, page_height,
+                    );
+                    let before: usize = counts.iter().take(index).sum();
+                    let total: usize = counts.iter().sum();
+                    format!("page {} of {}", (before + page + 1).min(total.max(1)), total.max(1))
+                }
+                false => format!("{}%", (book.progress(index, within) * 100.0).round() as u8),
+            };
+
             let (_, fg, subtle, panel) = theme.chrome_colors();
             chapter::layout_document(
-                hud::html(&book.title, percent, h as f32),
+                hud::html(&book.title, &readout, cols as usize, false, h as f32),
                 hud::stylesheet(fg, subtle, panel),
                 None,
-                make_viewport(),
+                // The HUD spans the window, not a column.
+                chapter::viewport(w, h, 1.0, theme == Theme::Night),
                 page_height,
             )
         })
@@ -122,13 +162,72 @@ pub fn run(args: &[String]) -> i32 {
     };
     let frame = Frame { width: w, height: h, scale: 1.0, margin, page_height: painted_height };
 
+    let count = ch.pages.count();
+    let slices: Vec<(f32, f32)> = (0..cols as usize)
+        .map(|c| page + c)
+        .map(|p| match p < count {
+            true => (ch.pages.top_of(p), ch.pages.extent_of(p)),
+            false => (0.0, 0.0),
+        })
+        .collect();
+    let column_css = col_w as f32;
+    let ground = Color::from_rgb8(r, g, b);
+
     let mut renderer = VelloImageRenderer::new(w, h);
     let mut rgba = Vec::new();
     renderer.render_to_vec(
         |scene| {
-            paint::page(scene, &mut ch.doc, top, extent, &frame, Color::from_rgb8(r, g, b));
+            for (col, &(ctop, cextent)) in slices.iter().enumerate() {
+                let x = col as f32 * column_css;
+                let blank = page + col >= count;
+                let (ctop, cextent) = if blank { (0.0, 0.0) } else { (ctop, cextent) };
+                paint::column(
+                    scene,
+                    &mut ch.doc,
+                    ctop,
+                    cextent,
+                    x,
+                    column_css,
+                    &frame,
+                    ground,
+                    col == 0,
+                );
+                if !blank {
+                    paint::bands(
+                        scene,
+                        &highlights,
+                        crate::HIGHLIGHT,
+                        ctop,
+                        cextent,
+                        x,
+                        &frame,
+                    );
+                }
+            }
             if let Some(c) = hud_doc.as_mut() {
+                // Icons are painted into the boxes the HUD reserved, exactly as
+                // the window does it.
+                let icons: Vec<(paint::Icon, (f32,f32,f32,f32))> = [
+                    ("bookmark", paint::Icon::Bookmark),
+                    ("contents", paint::Icon::Contents),
+                    ("highlight", paint::Icon::Highlight),
+                    ("back", paint::Icon::Back),
+                ]
+                .into_iter()
+                .filter_map(|(name, icon)| {
+                    let node = crate::find_by_attr(c.dom(), 0, "data-icon", name)?;
+                    Some((icon, chapter::node_rect(c.dom(), node)?))
+                })
+                .collect();
+
+                if std::env::var_os("OMAREAD_DEBUG_PAINT").is_some() {
+                    eprintln!("ICONS {icons:?}");
+                }
                 paint::overlay(scene, &mut c.doc, &frame);
+                let ink = crate::parse_hex(theme.chrome_colors().1);
+                for (icon, rect) in icons {
+                    paint::icon(scene, icon, rect, ink, 1.0);
+                }
             }
         },
         &mut rgba,
@@ -145,6 +244,82 @@ pub fn run(args: &[String]) -> i32 {
             );
             0
         }
+        Err(e) => {
+            eprintln!("omaread: {e}");
+            1
+        }
+    }
+}
+
+/// Render the library view. The grid is a document like any other, so this is
+/// the same paint path — which is the point: a shot that renders differently
+/// from the window verifies nothing.
+///
+/// Covers stay blank: they arrive through the resource callback, which needs an
+/// event loop to drain. Layout is what this is for.
+fn library_shot(args: &[String]) -> i32 {
+    let [out, rest @ ..] = args else {
+        eprintln!("usage: omaread --shot library <out.ppm> [query]");
+        return 2;
+    };
+    let query = rest.first().cloned().unwrap_or_default();
+
+    let db = match crate::db::Db::open() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("omaread: {e}");
+            return 1;
+        }
+    };
+    let rows = db.books(&query, crate::db::Sort::Recent).unwrap_or_default();
+    let suggestions = match query.trim().is_empty() {
+        true => Vec::new(),
+        false => db.suggestions(&query, 6),
+    };
+    println!("library: {} books, {} suggestions", rows.len(), suggestions.len());
+
+    let (w, h) = size_from_env();
+    let style = ReadingStyle::default();
+    let margin = PAGE_MARGIN_EM * style.font_px();
+    let page_height = (h as f32 - 2.0 * margin).max(1.0);
+    let (bg, fg, subtle, panel) = Theme::White.chrome_colors();
+
+    let Some(mut doc) = chapter::layout_document(
+        crate::grid::html(&rows, &query, crate::db::Sort::Recent, &suggestions, None, 0..rows.len()),
+        crate::grid::stylesheet(bg, fg, subtle, panel),
+        None,
+        chapter::viewport(w, h, 1.0, false),
+        page_height,
+    ) else {
+        eprintln!("omaread: the library document failed to lay out");
+        return 1;
+    };
+
+    let frame = Frame { width: w, height: h, scale: 1.0, margin, page_height };
+    let extent = doc.pages.extent_of(0);
+    let mut renderer = VelloImageRenderer::new(w, h);
+    let mut rgba = Vec::new();
+    renderer.render_to_vec(
+        |scene| {
+            paint::page(scene, &mut doc.doc, 0.0, extent, &frame, crate::parse_hex(bg));
+            // Outline the first card, the way the window outlines the selection.
+            if let Some(rect) = crate::find_by_attr(doc.dom(), 0, "data-index", "0")
+                .and_then(|n| chapter::node_rect(doc.dom(), n))
+            {
+                paint::outline(
+                    scene,
+                    (rect.0, rect.1 + margin, rect.2, rect.3),
+                    crate::CARD_OUTLINE,
+                    2.0,
+                    1.0,
+                );
+            }
+        },
+        &mut rgba,
+    );
+
+    match write_ppm(out, &rgba, w, h) {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("omaread: {e}");
             1

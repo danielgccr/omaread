@@ -125,6 +125,7 @@ pub fn describe(path: &Path, hash: String) -> Result<BookRow, String> {
         managed: path.starts_with(library_dir()),
         missing: false,
         started: false,
+        tags: Vec::new(),
     })
 }
 

@@ -215,6 +215,20 @@ pub fn fold(s: &str) -> String {
         .collect()
 }
 
+/// Where `needle` sits in `text`, as `(character offset, character length)`.
+///
+/// Compared folded, so an unaccented query matches accented text — and counted
+/// in characters, because folding is one-to-one per character but not per byte
+/// ("á" is two bytes, "a" is one). Character offsets are also what a CFI stores.
+pub fn char_match(text: &str, needle: &str) -> Option<(usize, usize)> {
+    let hay: Vec<char> = fold(text).chars().collect();
+    let pin: Vec<char> = fold(needle).chars().collect();
+    if pin.is_empty() || pin.len() > hay.len() {
+        return None;
+    }
+    hay.windows(pin.len()).position(|w| w == pin.as_slice()).map(|at| (at, pin.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +272,21 @@ mod tests {
         assert_eq!(fold("MAÑANA"), "manana");
         assert_eq!(fold("Coneixença"), "coneixenca");
         assert!(fold("ma\u{00ad}ñana").contains("ma nana"));
+    }
+
+    /// Offsets must be in characters: folding "á" to "a" changes the byte
+    /// length, so a byte offset taken from folded text would land mid-glyph.
+    #[test]
+    fn char_match_counts_characters_not_bytes() {
+        let text = "la resonancia de la tipografía siempre";
+        let (at, len) = char_match(text, "tipografia").expect("accent-folded match");
+        assert_eq!(len, 10);
+        assert_eq!(text.chars().skip(at).take(len).collect::<String>(), "tipografía");
+
+        assert_eq!(char_match(text, "resonancia").map(|(a, _)| a), Some(3));
+        assert_eq!(char_match(text, "zzz"), None);
+        assert_eq!(char_match("short", "much longer than the text"), None);
+        assert_eq!(char_match("x", ""), None);
     }
 
     /// A query is user input at a trust boundary: FTS5 syntax errors read as
