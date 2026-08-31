@@ -245,8 +245,74 @@ fn drop_spans(s: &str, open: &str, close: &str) -> String {
     out
 }
 
+/// App chrome as CSS colour strings: (background, foreground, subtle, panel).
+pub type Chrome = (String, String, String, String);
+
+/// Where Omarchy leaves the palette it rendered for us.
+const OMARCHY_CSS: &str = ".local/state/omarchy/current/theme/omaread.css";
+
+/// The chrome palette Omarchy rendered, if there is one.
+///
+/// Omarchy renders every `~/.config/omarchy/themed/*.tpl` into the active theme
+/// directory on a theme change, so the whole integration is a file read and four
+/// custom properties (CONTEXT.md §11). Nothing here parses a theme, and nothing
+/// has to track upstream's format. `None` off Omarchy, or when the template is
+/// not installed — the reader then uses its own palette.
+pub fn omarchy_chrome() -> Option<Chrome> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::Path::new(&home).join(OMARCHY_CSS);
+    parse_chrome(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Pull `--bg`, `--fg`, `--subtle` and `--panel` out of a rendered stylesheet.
+///
+/// Anything not a `#rrggbb` is rejected rather than passed on: a half-rendered
+/// template would otherwise paint the whole library black, since that is what an
+/// unparseable colour becomes.
+fn parse_chrome(css: &str) -> Option<Chrome> {
+    let value = |name: &str| -> Option<String> {
+        let key = format!("--{name}:");
+        let at = css.find(&key)? + key.len();
+        let raw = css[at..].split(';').next()?.trim();
+        let hex = raw.len() == 7
+            && raw.starts_with('#')
+            && raw[1..].chars().all(|c| c.is_ascii_hexdigit());
+        hex.then(|| raw.to_string())
+    };
+    Some((value("bg")?, value("fg")?, value("subtle")?, value("panel")?))
+}
+
 #[cfg(test)]
 mod tests {
+    /// The rendered template is the whole Omarchy integration, so its parse is
+    /// the thing that must not quietly do the wrong thing.
+    #[test]
+    fn the_omarchy_palette_is_read_or_refused() {
+        let good = ":root {\n  --bg: #2e3440;\n  --fg: #d8dee9;\n\
+                    --subtle: #4c566a;\n  --panel: #434c5e;\n}\n";
+        assert_eq!(
+            super::parse_chrome(good),
+            Some((
+                "#2e3440".to_string(),
+                "#d8dee9".to_string(),
+                "#4c566a".to_string(),
+                "#434c5e".to_string(),
+            ))
+        );
+
+        // A key that merely starts the same must not be mistaken for `--bg`.
+        assert_eq!(super::parse_chrome("--background: #2e3440;"), None);
+        // Missing one property is not a palette.
+        assert_eq!(super::parse_chrome("--bg: #2e3440; --fg: #fff;"), None);
+        // An unrendered template would otherwise become black.
+        assert_eq!(
+            super::parse_chrome(
+                "--bg: {{ background }}; --fg: #d8dee9; --subtle: #4c566a; --panel: #434c5e;"
+            ),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -30,6 +30,10 @@ struct Tally {
     empty: usize,
     panicked: usize,
     cutting: usize,
+    /// Cuts through an atom that is itself taller than a page. Unavoidable: a
+    /// table row 1338px tall cannot fit a 900px page whatever the paginator
+    /// does, and the alternative is wedging the reader. Counted, not failed.
+    oversized: usize,
     stalled: usize,
     /// Books with no usable navigation, falling back to a bare spine list.
     no_toc: usize,
@@ -103,9 +107,20 @@ pub fn run(paths: &[String]) -> i32 {
             let atoms = chapter::collect_atoms(ch.dom());
             for (n, &top) in ch.pages.tops.iter().enumerate() {
                 if let Some(a) = cuts(&atoms, top) {
-                    t.cutting += 1;
+                    // An atom taller than the page has no legal break in it.
+                    let unavoidable = atoms
+                        .iter()
+                        .filter(|o| o.splits(top))
+                        .any(|o| o.bottom - o.top > page_h);
+                    let label = if unavoidable {
+                        t.oversized += 1;
+                        "BIG "
+                    } else {
+                        t.cutting += 1;
+                        "CUT "
+                    };
                     eprintln!(
-                        "CUT  {path} ch{} page {n} at {top:.1} through {:?} {:.1}..{:.1}",
+                        "{label} {path} ch{} page {n} at {top:.1} through {:?} {:.1}..{:.1}",
                         i + 1,
                         a.kind,
                         a.top,
@@ -146,8 +161,8 @@ pub fn run(paths: &[String]) -> i32 {
     }
 
     println!(
-        "checked {} books, {} chapters, {} pages | empty {} | engine panics {} | breaks cutting an atom {} | stalls {}",
-        t.books, t.chapters, t.pages, t.empty, t.panicked, t.cutting, t.stalled
+        "checked {} books, {} chapters, {} pages | empty {} | engine panics {} | breaks cutting an atom {} | stalls {} | unavoidable cuts through an over-tall atom {}",
+        t.books, t.chapters, t.pages, t.empty, t.panicked, t.cutting, t.stalled, t.oversized
     );
     println!(
         "contents: {} entries | books falling back to the spine {} | dangling fragments {}",

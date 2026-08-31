@@ -73,6 +73,24 @@ impl Pages {
         self.tops.get(page).copied().unwrap_or(0.0)
     }
 
+    /// How much flow this page actually shows: the distance to the next page's
+    /// top, or to the end of the content on the last page.
+    ///
+    /// This is almost never the full `page_height`. A break snaps *up* to a line
+    /// boundary, so a page typically ends short of its nominal height — by 28px
+    /// on a real page measured at 900. Anything painted past this point belongs
+    /// to the next page, which is why the margin mask is positioned from here
+    /// and not from `page_height`: masking lower leaves a slice of the next
+    /// page's first line on show, cut off halfway down.
+    pub fn extent_of(&self, page: usize) -> f32 {
+        let top = self.top_of(page);
+        let next = match self.tops.get(page + 1) {
+            Some(&next) => next,
+            None => self.content_height,
+        };
+        (next - top).clamp(0.0, self.page_height)
+    }
+
     /// Which page a flow offset falls on. Used to keep the reader's place across
     /// a re-flow, and later to resolve a CFI to a page.
     pub fn page_containing(&self, y: f32) -> usize {
@@ -217,6 +235,34 @@ fn nth_of_group(atoms: &[Atom], group: usize, n: usize) -> Option<&Atom> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The mask is placed from the extent, so this arithmetic is what keeps the
+    /// next page's first line off the screen.
+    #[test]
+    fn extent_is_the_distance_to_the_next_page_not_the_nominal_height() {
+        let pages = Pages {
+            tops: vec![0.0, 872.0, 1744.0],
+            page_height: 900.0,
+            content_height: 2500.0,
+        };
+        assert_eq!(pages.extent_of(0), 872.0, "a break snaps up, so a page ends short");
+        assert_eq!(pages.extent_of(1), 872.0);
+        // The last page runs to the end of the content, never past it.
+        assert_eq!(pages.extent_of(2), 756.0);
+    }
+
+    /// A last page with more content left than fits still shows only a page.
+    #[test]
+    fn extent_never_exceeds_the_page_height() {
+        let pages = Pages {
+            tops: vec![0.0],
+            page_height: 900.0,
+            content_height: 5000.0,
+        };
+        assert_eq!(pages.extent_of(0), 900.0);
+    }
+
     use super::*;
 
     /// `count` lines of `h` px starting at `start`, all one paragraph.

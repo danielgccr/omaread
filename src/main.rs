@@ -9,17 +9,19 @@ mod cfi;
 mod check;
 mod db;
 mod grid;
+mod hud;
 mod hyphen;
 mod library;
 mod paginate;
+mod paint;
+mod search;
+mod shot;
 mod style;
 mod toc;
 
-use anyrender::{PaintScene, WindowRenderer};
+use anyrender::WindowRenderer;
 use anyrender_vello::VelloWindowRenderer;
-use blitz_dom::Point;
-use kurbo::{Affine, Rect};
-use peniko::{Color, Fill};
+use peniko::Color;
 use blitz_dom::net::Resource;
 use blitz_traits::net::{NetCallback, SharedCallback};
 use book::Book;
@@ -30,12 +32,16 @@ use chapter::Chapter;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use style::{GUTTER_EM, MEASURE_EM, PAGE_MARGIN_EM, ReadingStyle, Theme};
+use std::time::{Duration, Instant};
+use style::{Chrome, GUTTER_EM, MEASURE_EM, PAGE_MARGIN_EM, ReadingStyle, Theme};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// How long the reading HUD lingers after the pointer stops moving.
+const HUD_LINGER: Duration = Duration::from_millis(2200);
 
 /// Below this window width, a second column would squeeze the measure into
 /// something unreadable, so two-column mode silently falls back to one.
@@ -55,12 +61,34 @@ fn main() {
         std::process::exit(check::run(&args[1..]));
     }
 
+    if args.first().map(String::as_str) == Some("--index") {
+        let code = match db::Db::open() {
+            Ok(db) => {
+                let (done, failed) = library::index_all(&db);
+                println!("indexed {done} books, {failed} failed");
+                (failed > 0) as i32
+            }
+            Err(e) => {
+                eprintln!("omaread: {e}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
+    if args.first().map(String::as_str) == Some("--shot") {
+        std::process::exit(shot::run(&args[1..]));
+    }
+
     if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
         println!(
             "omaread [book.epub] [chapter]   open the library, or a book\n\
-             omaread --check <book.epub>...  headless conformance run\n\n\
+             omaread --check <book.epub>...  headless conformance run\n\
+             omaread --shot <book.epub> <chapter> <page> <out.ppm> [hud]\n\
+             omaread --index                 index every library book for search\n\n\
              Library:  type to search · Enter open · Tab sort · F5 rescan · Esc clear/quit\n\
-             Reading:  ←/→ page · ↑/↓ chapter · Tab contents · t theme · +/- size · l library · q quit\n\
+             Reading:  ←/→ page · ↑/↓ chapter · Tab contents · / search · t theme · +/- size · l library · q quit\n\
+                       move the mouse for the title and how far through you are\n\
              Contents: ↑/↓ select · Enter go · Tab or Esc back"
         );
         return;
@@ -111,6 +139,19 @@ struct App {
     lib_doc: Option<Chapter>,
     /// The contents list. Rebuilt on every open and on every selection move.
     toc_doc: Option<Chapter>,
+    /// Title and progress, painted over the page while the pointer is active.
+    hud_doc: Option<Chapter>,
+    /// What `hud_doc` was built from; it is rebuilt only when this changes,
+    /// because pointer motion arrives far faster than the text does.
+    hud_key: String,
+    hud_shown: bool,
+    /// In-book search: the query, and whether the contents view is showing hits
+    /// instead of navigation. Both lists are "places in this book", so they are
+    /// the same view.
+    find: String,
+    finding: bool,
+    /// When to put the HUD away. Drives `ControlFlow::WaitUntil`.
+    hud_until: Option<Instant>,
     toc_sel: usize,
     /// The reading page to come back to when the contents close. All three
     /// views share `page`, so it has to be put somewhere.
@@ -124,6 +165,9 @@ struct App {
     /// Patterns for the book's `dc:language`; None means no hyphenation.
     hyphenator: Option<hyphen::Hyphenator_>,
     style: ReadingStyle,
+    /// Palette Omarchy rendered for the app chrome. `None` elsewhere, and the
+    /// chrome then follows the reading theme (CONTEXT.md §11).
+    chrome: Option<Chrome>,
     chapter: Option<Chapter>,
     index: usize,
     page: usize,
@@ -156,6 +200,12 @@ impl App {
             selected: 0,
             lib_doc: None,
             toc_doc: None,
+            hud_doc: None,
+            hud_key: String::new(),
+            hud_shown: false,
+            find: String::new(),
+            finding: false,
+            hud_until: None,
             toc_sel: 0,
             resume_page: 0,
             book: None,
@@ -165,6 +215,7 @@ impl App {
             pending: None,
             hyphenator: None,
             style: ReadingStyle::default(),
+            chrome: style::omarchy_chrome(),
             chapter: None,
             index: start,
             page: 0,
@@ -177,6 +228,14 @@ impl App {
             scale: 1.0,
             cursor: (0.0, 0.0),
         };
+
+        println!(
+            "omaread: chrome — {}",
+            match &app.chrome {
+                Some((bg, ..)) => format!("Omarchy palette, ground {bg}"),
+                None => "built-in palette (no omaread.css from Omarchy)".into(),
+            }
+        );
 
         if let Some(db) = app.db.clone() {
             if let Ok(d) = db.lock() {
@@ -228,6 +287,7 @@ impl App {
             Some(c) if c.spine < book.chapter_count() => c.spine,
             _ => start,
         };
+        self.index_book(&book);
         self.hyphenator = hyphen::Hyphenator_::for_language(&book.language);
         println!(
             "omaread: {} ({} chapters, {})",
@@ -263,9 +323,9 @@ impl App {
     /// selection — the whole document is cheap next to a chapter, and an
     /// incremental DOM diff is complexity nobody has asked for.
     fn build_library(&mut self) {
-        let (bg, fg, subtle, panel) = self.style.theme.chrome_colors();
+        let (bg, fg, subtle, panel) = self.chrome();
         let html = grid::html(&self.rows, &self.query, self.sort, self.selected);
-        let ua = grid::stylesheet(bg, fg, subtle, panel);
+        let ua = grid::stylesheet(&bg, &fg, &subtle, &panel);
 
         let provider = self.db.clone().map(|db| {
             Arc::new(net::CoverProvider::new(db, self.callback()))
@@ -279,6 +339,62 @@ impl App {
             .min(self.lib_doc.as_ref().map_or(0, |c| c.pages.count().saturating_sub(1)));
     }
 
+    /// Lay out the HUD, unless the one in hand already says the right thing.
+    fn build_hud(&mut self) {
+        let Some(book) = self.book.clone() else { return };
+        let percent = (self.progress() * 100.0).round() as u8;
+        let height = self.size.1 as f32 / self.scale;
+        let key = format!("{percent}|{height}|{:?}|{}", self.style.theme, book.title);
+        if key == self.hud_key && self.hud_doc.is_some() {
+            return;
+        }
+
+        let (_, fg, subtle, panel) = self.chrome();
+        let html = hud::html(&book.title, percent, height);
+        let ua = hud::stylesheet(&fg, &subtle, &panel);
+        self.hud_doc =
+            chapter::layout_document(html, ua, None, self.viewport(), self.page_height());
+        self.hud_key = key;
+    }
+
+    /// Index the book's text the first time it is opened. Search over a book
+    /// you have never opened is what `--index` is for.
+    fn index_book(&self, book: &Book) {
+        let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) else { return };
+        if db.is_indexed(&self.hash) {
+            return;
+        }
+        match library::index_book(&db, &self.hash, book) {
+            Ok(n) => println!("omaread: indexed {n} chapters for search"),
+            // Search is a convenience; a failure here must not stop you reading.
+            Err(e) => eprintln!("omaread: could not index: {e}"),
+        }
+    }
+
+    /// How far through the book the current page is, 0.0..=1.0.
+    fn progress(&self) -> f32 {
+        let Some(book) = &self.book else { return 0.0 };
+        let within = match &self.chapter {
+            Some(ch) if ch.pages.content_height > 0.0 => {
+                ch.pages.top_of(self.page) / ch.pages.content_height
+            }
+            _ => 0.0,
+        };
+        book.progress(self.index, within)
+    }
+
+    /// Wake the HUD and start its clock. Pointer motion is the gesture.
+    fn poke_hud(&mut self) {
+        if self.view != View::Reading {
+            return;
+        }
+        self.hud_until = Some(Instant::now() + HUD_LINGER);
+        if !self.hud_shown {
+            self.hud_shown = true;
+            self.request_redraw();
+        }
+    }
+
     fn to_library(&mut self) {
         self.save_position();
         if let Some(w) = &self.window {
@@ -287,6 +403,15 @@ impl App {
         self.reload_rows();
         self.view = View::Library;
         self.request_redraw();
+    }
+
+    /// The app chrome palette: Omarchy's when it rendered one, the reading
+    /// theme's otherwise. Every chrome surface goes through here.
+    fn chrome(&self) -> Chrome {
+        self.chrome.clone().unwrap_or_else(|| {
+            let (bg, fg, subtle, panel) = self.style.theme.chrome_colors();
+            (bg.into(), fg.into(), subtle.into(), panel.into())
+        })
     }
 
     /// The document the current view paints. Every view is one.
@@ -311,22 +436,68 @@ impl App {
     /// library grid makes.
     fn build_toc(&mut self) {
         let Some(book) = self.book.clone() else { return };
-        let (bg, fg, subtle, panel) = self.style.theme.chrome_colors();
-        let html = toc::html(&book.toc, &book.title, self.index, self.toc_sel);
-        let ua = toc::stylesheet(bg, fg, subtle, panel);
+        let entries = self.toc_entries();
+        let (heading, subtitle) = match self.finding {
+            true => (
+                "Search",
+                format!(
+                    "“{}” — {} hit{} in this book",
+                    self.find,
+                    entries.len(),
+                    if entries.len() == 1 { "" } else { "s" }
+                ),
+            ),
+            false => ("Contents", book.title.clone()),
+        };
+        let (bg, fg, subtle, panel) = self.chrome();
+        let html = toc::html(&entries, heading, &subtitle, self.index, self.toc_sel);
+        let ua = toc::stylesheet(&bg, &fg, &subtle, &panel);
         self.toc_doc =
             chapter::layout_document(html, ua, None, self.viewport(), self.page_height());
+    }
+
+    /// What the contents view lists: the book's navigation, or search hits.
+    fn toc_entries(&self) -> Vec<book::TocEntry> {
+        let Some(book) = &self.book else { return Vec::new() };
+        if !self.finding {
+            return (*book.toc).clone();
+        }
+        let Some(fts) = search::fts_query(&self.find) else { return Vec::new() };
+        let Some(db) = self.db.as_ref().and_then(|d| d.lock().ok()) else { return Vec::new() };
+
+        db.search_in_book(&self.hash, &fts, 200)
+            .into_iter()
+            .map(|hit| {
+                // Name the chapter from the book's own navigation when it has
+                // one: "Chapter 4 · …the words…" beats a bare snippet.
+                let where_ = book
+                    .toc
+                    .iter()
+                    .filter(|e| e.spine <= hit.spine)
+                    .next_back()
+                    .map(|e| e.label.clone())
+                    .unwrap_or_else(|| format!("Chapter {}", hit.spine + 1));
+                book::TocEntry {
+                    label: format!("{where_} · {}", hit.snippet),
+                    depth: 0,
+                    spine: hit.spine,
+                    fragment: None,
+                    find: Some(self.find.clone()),
+                }
+            })
+            .collect()
     }
 
     fn open_toc(&mut self) {
         let Some(toc) = self.book.as_ref().map(|b| b.toc.clone()) else { return };
         self.resume_page = self.page;
         // Open on the entry covering where you are, not at the top: in a long
-        // book the useful part of the contents is the part you are in.
-        self.toc_sel = toc
-            .iter()
-            .rposition(|e| e.spine <= self.index)
-            .unwrap_or(0);
+        // book the useful part of the contents is the part you are in. A search
+        // starts at the best hit, which is the first one.
+        self.toc_sel = match self.finding {
+            true => 0,
+            false => toc.iter().rposition(|e| e.spine <= self.index).unwrap_or(0),
+        };
         self.view = View::Toc;
         self.page = 0;
         self.build_toc();
@@ -335,6 +506,7 @@ impl App {
     }
 
     fn close_toc(&mut self) {
+        self.finding = false;
         self.view = View::Reading;
         self.page = self.resume_page.min(self.page_count().saturating_sub(1));
         self.request_redraw();
@@ -350,6 +522,23 @@ impl App {
             self.page = 0;
         } else {
             self.load_chapter(entry.spine);
+        }
+        // A hit knows its words, not its element: locate the text in the
+        // chapter that is now laid out.
+        if let Some(needle) = &entry.find {
+            match self
+                .chapter
+                .as_ref()
+                .and_then(|ch| chapter::node_containing_text(ch.dom(), needle))
+                .and_then(|node| {
+                    let ch = self.chapter.as_ref()?;
+                    Some(ch.pages.page_containing(chapter::node_top(ch.dom(), node)?))
+                }) {
+                Some(page) => self.page = page,
+                // Folding is close but not identical to FTS5's, so a miss is
+                // possible; the chapter is still the right place to be.
+                None => eprintln!("omaread: “{needle}” did not resolve to a page in this chapter"),
+            }
         }
         if let Some(frag) = &entry.fragment {
             match self
@@ -683,22 +872,22 @@ impl App {
                 let [r, g, b] = self.style.theme.background_rgb();
                 Color::from_rgb8(r, g, b)
             }
-            _ => {
-                let (bg, ..) = self.style.theme.chrome_colors();
-                parse_hex(bg)
-            }
+            _ => parse_hex(&self.chrome().0),
         };
 
         match self.view {
             View::Library if self.lib_doc.is_none() => self.build_library(),
             View::Toc if self.toc_doc.is_none() => self.build_toc(),
+            View::Reading if self.hud_shown => self.build_hud(),
             _ => {}
         }
+        let showing_hud = self.hud_shown && self.view == View::Reading;
 
         // Disjoint field borrows: `render` takes the renderer mutably, the
         // closure needs the document mutably to set the page offset. That rules
         // out `doc_mut`, which borrows all of `self`.
-        let App { renderer, chapter, lib_doc, toc_doc, view, .. } = self;
+        let App { renderer, chapter, lib_doc, toc_doc, hud_doc, view, .. } = self;
+        let hud = if showing_hud { hud_doc.as_mut() } else { None };
         let Some(ch) = (match view {
             View::Library => lib_doc.as_mut(),
             View::Toc => toc_doc.as_mut(),
@@ -707,6 +896,7 @@ impl App {
             return;
         };
         let top = ch.pages.top_of(page);
+        let extent = ch.pages.extent_of(page);
         if std::env::var_os("OMAREAD_DEBUG_PAINT").is_some() {
             eprintln!(
                 "PAINT page {}/{} top={top:.0} page_h={page_h:.0} margin={margin:.0} win={w}x{h}",
@@ -715,35 +905,21 @@ impl App {
             );
         }
         let doc = &mut ch.doc;
+        let frame = paint::Frame {
+            width: w,
+            height: h,
+            scale,
+            margin,
+            page_height: page_h,
+        };
 
         renderer.render(|scene| {
             // An engine panic while painting must not take the window with it.
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                // `viewport_scroll` is the only thing that moves painted content:
-                // a layer transform repositions a clip shape but not the drawing
-                // commands inside it. Offsetting by `top - margin` puts this
-                // page's first line just below the top margin.
-                doc.set_viewport_scroll(Point { x: 0.0, y: (top - margin) as f64 });
-
-                // NOTE: paint_scene calls scene.reset() first, discarding
-                // anything drawn before it — so the page ground and the margin
-                // masks must come *after*. See CONTEXT.md §9.
-                blitz_paint::paint_scene(scene, &*doc, scale, w, h);
-
-                // The flow continues above and below this page. Mask it, so the
-                // margins show the neighbouring lines' halves as clean paper.
-                let band = |scene: &mut _, y0: f64, y1: f64| {
-                    PaintScene::fill(
-                        scene,
-                        Fill::NonZero,
-                        Affine::IDENTITY,
-                        ground,
-                        None,
-                        &Rect::new(0.0, y0, w as f64, y1),
-                    );
-                };
-                band(scene, 0.0, margin as f64 * scale);
-                band(scene, (margin + page_h) as f64 * scale, h as f64);
+                paint::page(scene, doc, top, extent, &frame, ground);
+                if let Some(hud) = hud {
+                    paint::overlay(scene, &mut hud.doc, &frame);
+                }
             }));
         });
     }
@@ -863,6 +1039,9 @@ impl App {
     }
 
     fn rescan(&mut self) {
+        // A theme switch rewrites the rendered palette, and F5 already means
+        // "pick up what changed on disk".
+        self.chrome = style::omarchy_chrome();
         let Some(db) = self.db.clone() else { return };
         if let Ok(d) = db.lock() {
             let (seen, added) = library::scan(&d);
@@ -886,6 +1065,11 @@ impl App {
                     event_loop.exit();
                 }
                 "l" => self.to_library(),
+                "/" => {
+                    self.find.clear();
+                    self.finding = true;
+                    self.open_toc();
+                }
                 "c" => {
                     println!(
                         "omaread: two-column is not paintable yet (blitz-paint resets the scene)"
@@ -921,9 +1105,33 @@ impl App {
     /// a place to configure anything.
     fn toc_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
         match key {
-            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Tab) => {
+            Key::Named(NamedKey::Escape) => {
+                // Esc backs out one step: query first, then the view.
+                if self.finding && !self.find.is_empty() {
+                    self.find.clear();
+                } else {
+                    self.close_toc();
+                    return;
+                }
+            }
+            Key::Named(NamedKey::Tab) => {
                 self.close_toc();
                 return;
+            }
+            Key::Named(NamedKey::Backspace) if self.finding => {
+                self.find.pop();
+                self.toc_sel = 0;
+            }
+            Key::Named(NamedKey::Space) if self.finding => {
+                self.find.push(' ');
+                self.toc_sel = 0;
+            }
+            // While searching every letter is query text, so the single-key
+            // commands below are unreachable — which is what you want when you
+            // are typing a word that happens to contain "q".
+            Key::Character(c) if self.finding => {
+                self.find.push_str(c.as_str());
+                self.toc_sel = 0;
             }
             Key::Named(NamedKey::Enter) => {
                 self.open_toc_entry(self.toc_sel);
@@ -1004,9 +1212,16 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        // Without an app_id the window reports an empty class, and every
+        // Hyprland rule keyed on it silently never matches — including the one
+        // shipped in assets/omarchy (CONTEXT.md §11).
+        #[cfg(target_os = "linux")]
+        use winit::platform::wayland::WindowAttributesExtWayland;
         let attrs = Window::default_attributes()
             .with_title("Omaread")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 1000.0));
+        #[cfg(target_os = "linux")]
+        let attrs = attrs.with_name("omaread", "omaread");
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         let size = window.inner_size();
@@ -1050,7 +1265,11 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                let moved = self.cursor != (position.x as f32, position.y as f32);
                 self.cursor = (position.x as f32, position.y as f32);
+                if moved {
+                    self.poke_hud();
+                }
             }
 
             WindowEvent::MouseInput { state, button, .. }
@@ -1080,7 +1299,20 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_resources();
+
+        // The HUD is the only thing here that happens without an event, so it is
+        // the only reason to ask the loop to wake on a clock.
+        match self.hud_until {
+            Some(at) if Instant::now() >= at => {
+                self.hud_until = None;
+                self.hud_shown = false;
+                event_loop.set_control_flow(ControlFlow::Wait);
+                self.request_redraw();
+            }
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => {}
+        }
     }
 }

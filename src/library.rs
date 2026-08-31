@@ -162,6 +162,42 @@ pub fn scan(db: &Db) -> (usize, usize) {
 ///
 /// Returns the path actually opened: the managed copy, or the original if it is
 /// already known or the copy fails.
+/// Extract and index the full text of one book. Idempotent.
+///
+/// The text is pulled from the raw XHTML, not from a laid-out document: a full
+/// Stylo/Taffy/Parley pass per chapter would make indexing cost more than
+/// reading the book (CONTEXT.md §4).
+pub fn index_book(db: &Db, hash: &str, book: &crate::book::Book) -> Result<usize, String> {
+    let chapters: Vec<(usize, String)> = (0..book.chapter_count())
+        .filter_map(|i| book.chapter_html(i).ok().map(|h| (i, crate::search::text_of_html(&h))))
+        .collect();
+    let indexed = chapters.iter().filter(|(_, t)| !t.trim().is_empty()).count();
+    db.index_book(hash, &chapters).map(|()| indexed)
+}
+
+/// Index every catalogued book that has no text yet. This is the backfill for
+/// books that were scanned but never opened; opening a book indexes it anyway.
+pub fn index_all(db: &Db) -> (usize, usize) {
+    let rows = db.books("", crate::db::Sort::Title).unwrap_or_default();
+    let mut done = 0;
+    let mut failed = 0;
+    for row in rows.iter().filter(|r| !r.missing && !db.is_indexed(&r.hash)) {
+        match crate::book::Book::open(&row.path)
+            .and_then(|b| index_book(db, &row.hash, &b))
+        {
+            Ok(n) => {
+                done += 1;
+                println!("indexed {n} chapters — {}", row.title);
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("FAIL index {}: {e}", row.path);
+            }
+        }
+    }
+    (done, failed)
+}
+
 pub fn import(db: &Db, path: &Path) -> PathBuf {
     let Ok(hash) = file_hash(path) else { return path.to_path_buf() };
 

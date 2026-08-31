@@ -16,6 +16,10 @@ pub struct TocEntry {
     /// hang a whole TOC off one spine file; without this every entry opens on
     /// page 1 of it.
     pub fragment: Option<String>,
+    /// Text to land on inside the chapter. Set on search hits, never on
+    /// navigation entries — a contents entry knows its element, a hit knows only
+    /// its words.
+    pub find: Option<String>,
 }
 
 /// An open book. Cheap to clone; the archive is shared.
@@ -35,6 +39,9 @@ pub struct Book {
     pub language: String,
     /// Flattened navigation, in document order. Never empty — see `read_toc`.
     pub toc: Arc<Vec<TocEntry>>,
+    /// Cumulative byte length of the spine items, with the total at the end, so
+    /// `offsets.len() == spine.len() + 1`. See `Book::progress`.
+    offsets: Arc<Vec<usize>>,
 }
 
 impl Book {
@@ -71,17 +78,47 @@ impl Book {
 
         let toc = read_toc(&epub, &spine);
 
+        // Reading progress is weighted by the size of each spine item. Counting
+        // spine items instead would call a two-page foreword and a sixty-page
+        // chapter the same fraction of a book. The bytes are the markup, not the
+        // prose, but they track it closely enough for a percentage and they cost
+        // one pass over the (already decompressed) text at open.
+        let mut offsets = Vec::with_capacity(spine.len() + 1);
+        let mut running = 0usize;
+        for href in &spine {
+            offsets.push(running);
+            running += epub.read_resource_bytes(href.as_str()).map_or(0, |b| b.len());
+        }
+        offsets.push(running);
+
         Ok(Self {
             inner: Arc::new(Mutex::new(epub)),
             spine: Arc::new(spine),
             title,
             language,
             toc: Arc::new(toc),
+            offsets: Arc::new(offsets),
         })
     }
 
     pub fn chapter_count(&self) -> usize {
         self.spine.len()
+    }
+
+    /// How far through the whole book a position is, as 0.0..=1.0.
+    ///
+    /// `within` is the fraction through the spine item, so the figure moves
+    /// smoothly page by page rather than jumping a whole chapter at a time.
+    pub fn progress(&self, spine: usize, within: f32) -> f32 {
+        let total = self.offsets.last().copied().unwrap_or(0) as f32;
+        if total <= 0.0 {
+            // Nothing readable to weigh by: fall back to counting spine items.
+            let n = self.spine.len().max(1) as f32;
+            return ((spine as f32 + within.clamp(0.0, 1.0)) / n).clamp(0.0, 1.0);
+        }
+        let start = self.offsets.get(spine).copied().unwrap_or(0) as f32;
+        let end = self.offsets.get(spine + 1).copied().unwrap_or(0) as f32;
+        ((start + (end - start) * within.clamp(0.0, 1.0)) / total).clamp(0.0, 1.0)
     }
 
     /// Href of the nth spine item, archive-root-relative.
@@ -144,6 +181,7 @@ fn read_toc(epub: &Epub, spine: &[String]) -> Vec<TocEntry> {
                     .href()
                     .and_then(|h| h.fragment())
                     .map(str::to_string),
+                find: None,
             });
         }
     }
@@ -164,6 +202,7 @@ fn read_toc(epub: &Epub, spine: &[String]) -> Vec<TocEntry> {
                 depth: 0,
                 spine: i,
                 fragment: None,
+                find: None,
             })
             .collect();
     }

@@ -177,7 +177,8 @@ One database. Holds:
 - book metadata, cover images as BLOB
 - reading progress (CFI), bookmarks, highlights, notes
 - collections / tags
-- **FTS5 over extracted chapter text**
+- **FTS5 over extracted chapter text** (built in Phase 6: ~400MB for 360 books,
+  indexed on open or via `omaread --index`)
 
 FTS5 gives in-book search and cross-library full-text search from one index, and
 the text has to be extracted anyway for CFI resolution. Search across the whole
@@ -365,7 +366,97 @@ also surfaced a real paginator bug (§9, row bands shorter than their lines);
 that is fixed, and the sweep is back to **0 panics, 0 breaks cutting an atom, 0
 stalls** across 786 chapters.
 
-Next: chrome — the invisible-chrome toggle, and the Omarchy theme template (§11).
+*Chrome, in part.* Moving the pointer raises a HUD over the page with the
+book's title and how far through it you are, and it puts itself away again after
+a couple of seconds — the gesture §3 asks for rather than a setting. It is a
+blitz document like every other surface here, painted over the page through
+`paint::NoReset` (§9). Progress is weighted by the byte length of each spine
+item, so a two-page foreword is not the same fraction of a book as a sixty-page
+chapter.
+
+Reading progress, the contents and the library all now go through one paint
+path (`src/paint.rs`), and `omaread --shot <book> <ch> <page> <out.ppm>` renders
+a page headlessly through that same path. That last one is not a toy: there is
+no way to eyeball a Wayland window from a script, and it is what found the mask
+bug above — the page *looked* fine, and only a row-by-row darkness profile
+showed the mask landing inside a glyph band.
+
+**Full-library sweep, 372 books:** 20986 chapters, 183642 pages, **0 engine
+panics, 0 stalls**, 20174 contents entries. Four breaks cut an atom; three of
+them cut a table row taller than a whole page (up to 1338px against a 900px
+page), which is unavoidable and now reported separately as `BIG` so the harness
+is not permanently red. **One is real** — a 35px line cut in *Cómo dejar de ser
+tu peor enemigo* ch.4 — and is the next paginator bug to chase. 554 dangling
+contents fragments across a handful of books whose own navigation is broken; 8
+books have no usable navigation at all and fall back to their spine.
+
+*Chrome, the rest.* The app chrome follows the active Omarchy theme, via the
+mechanism §11 asks for and nothing more: `assets/omarchy/omaread.css.tpl` goes
+in `~/.config/omarchy/themed/`, Omarchy renders it into the active theme
+directory on a theme switch, and Omaread reads four custom properties out of the
+result (`--bg`, `--fg`, `--subtle`, `--panel`). No theme parsing, nothing to keep
+in sync with upstream. Off Omarchy, or before the template is installed, the
+chrome keeps following the reading theme. F5 re-reads it, so a theme switch does
+not need a restart. A value that is not a `#rrggbb` is refused rather than
+passed on — an unrendered `{{ background }}` would otherwise paint the library
+black.
+
+`assets/omarchy/omaread.conf` is the suggested Hyprland window rule and
+keybinding. Writing it turned up a real bug: the window had **no `app_id` at
+all**, so every rule keyed on `class:` would have silently never matched. winit
+does not set one unless asked; it is set now, and `hyprctl clients` reports
+`class: omaread`.
+
+**The invisible-chrome toggle is the pointer gesture**, and it is done. §3 is
+explicit that it is a gesture rather than a setting, so there is no key and no
+persisted flag: the reading view has no chrome until the pointer moves, and the
+HUD leaves again on its own. Nothing further to build here.
+
+**Phase 5 complete** — hyphenation, contents, bundled faces, HUD, and Omarchy
+theming. Themes and font size have worked since Phase 1.
+
+**Phase 6 complete** — search. One FTS5 index over extracted chapter text
+answers both questions §4 asks it to.
+
+*Extraction* reads the raw XHTML (`search::text_of_html`), not a laid-out
+document: indexing must not cost a Stylo/Taffy/Parley pass per chapter. It is a
+tag scanner, and the parts that matter are the ones that bite — block tags
+become word breaks (or `<p>one</p><p>two</p>` indexes as "onetwo"), `<script>`
+content is skipped by *finding its close tag* rather than counting depth
+(`1 < 2` inside a script otherwise looks like a tag and eats the rest of the
+chapter), soft hyphens we inserted never reach the index, and an unterminated
+tag at EOF is dropped rather than indexed as prose.
+
+*Tokenising* is `unicode61 remove_diacritics 2`, which is not optional for this
+library: it is mostly Spanish and Catalan, and without it "cancion" does not find
+"canción" — which is how people type when they are searching.
+
+*Queries* are never handed to FTS5 raw. Every token is quoted, which strips all
+operator meaning, and the last gets a `*` so hits appear while you are still
+typing. A syntax error here would read as "nothing found", which is the worst
+failure available.
+
+*In-book search is the contents view.* Both are a list of places in this book, so
+`/` reuses the same document, keys, paging and hit-testing that Tab uses; a
+search hit is a `TocEntry` carrying `find` instead of a `fragment`. Following one
+locates the text in the laid-out chapter and lands on its page — folding accents
+the same way the index did, and falling back to the query's longest word when the
+phrase straddles an inline tag.
+
+*Typing in the library now searches the pages too*, off the same index, for the
+cost of one `OR` and a subquery.
+
+**Measured on the real library:** `--index` indexed **359 books, 19626 chapter
+rows, in 14 seconds**. The database is **406MB** — which is why nothing indexes
+the whole library on its own: opening a book indexes that book (cheap, and it is
+about to be read anyway), and `omaread --index` is the explicit backfill. Spot
+checks against real prose: "cancion" hits accented text across four books, and
+following the accent-free query "tipografia siempre estaba" lands on page 7 of
+ch.10 of Postman, on the line "la resonancia de la tipografía siempre estaba
+presente".
+
+Next: Phase 7, bookmarks, highlights and notes — the first thing that needs
+sub-paragraph CFI precision (§4).
 
 ## 9. Spike findings (verified, not assumed)
 
@@ -434,6 +525,27 @@ discarding everything drawn into the scene before it. Two consequences:
    `VelloScenePainter.inner` is `pub(crate)`. Needs an upstream non-resetting
    paint entry point, or access to the inner scene. The paginator itself already
    supports two columns (pages `2n`/`2n+1` of one flow); only painting is blocked.
+
+**`paint_scene` is generic over `impl PaintScene`, and that is the way out.**
+The reset that blocked compositing (above) happens on *our* value: the trait is
+public and implementable, so a wrapper that forwards every method and makes
+`reset` a no-op lets a second document paint *over* the first instead of
+erasing it. `paint::NoReset` is that wrapper, about forty lines of forwarding,
+and the reading HUD is painted through it.
+
+This retires the second half of the `paint_scene` note above. **Two-column is no
+longer blocked on upstream** — it needs the same wrapper and a per-column
+`set_viewport_scroll`, not a new blitz release. Painting the page ground and
+masks after the call is still required.
+
+**A page is shorter than the page height, and the mask has to know it.** Breaks
+snap *up* to an atom boundary, so a page ends short of its nominal height — 872
+of 900 on a measured page. The margin mask was placed at `margin + page_height`
+regardless, which left that 28px gap showing the *next* page's first line,
+guillotined halfway down. It reads exactly like the last line being cut off,
+which is how it was reported. Masking from `Pages::extent_of(page)` — the
+distance to the next break — is the fix; nothing about the pagination changed,
+only where the paper starts again.
 
 **A layer transform positions the clip shape, not the content.**
 `push_clip_layer(transform, clip)` moves where the clip *is*; drawing commands
@@ -534,8 +646,13 @@ integration degrades to a sensible default elsewhere.
   pages of prose. Off Omarchy, chrome falls back to its own neutral palette.
 - Ship an `omaread.css.tpl` for Omarchy's template-rendering theme mechanism
   (cf. `~/.config/omarchy/themed/alacritty.toml.tpl.sample`) rather than parsing
-  theme files ourselves.
-- Ship a suggested Hyprland window rule and keybinding.
+  theme files ourselves. **Done**, in `assets/omarchy/`. Omarchy renders every
+  `~/.config/omarchy/themed/*.tpl` into
+  `~/.local/state/omarchy/current/theme/`, so the read side is one file and four
+  custom properties.
+- Ship a suggested Hyprland window rule and keybinding. **Done**, same
+  directory. The window sets `app_id = omaread`; without it the class is empty
+  and no rule matches.
 - **Binary is `omaread`.** Not `omarchy-read` — `omarchy-*` is upstream's
   namespace; squatting it invites confusion and makes upstream inclusion harder,
   not easier.

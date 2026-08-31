@@ -49,7 +49,7 @@ impl Chapter {
     /// Total characters of laid-out inline text. Zero means nothing will paint.
     pub fn text_len(&self) -> usize {
         let mut n = 0;
-        walk_elements(self.dom(), 0, &mut |el| {
+        walk_elements(self.dom(), 0, &mut |_, el| {
             if let Some(tl) = el.inline_layout_data.as_ref() {
                 n += tl.text.len();
             }
@@ -60,7 +60,7 @@ impl Chapter {
     /// Line boxes across the chapter — the atoms Phase 2 paginates on.
     pub fn line_count(&self) -> usize {
         let mut n = 0;
-        walk_elements(self.dom(), 0, &mut |el| {
+        walk_elements(self.dom(), 0, &mut |_, el| {
             if let Some(tl) = el.inline_layout_data.as_ref() {
                 n += tl.layout.lines().count();
             }
@@ -367,6 +367,43 @@ pub fn node_top(dom: &BaseDocument, target: usize) -> Option<f32> {
     walk(dom, 0, 0.0, target)
 }
 
+/// The first element whose text contains `needle`, folded so an unaccented
+/// query finds an accented word. Used to land a search hit on its page.
+pub fn node_containing_text(dom: &BaseDocument, needle: &str) -> Option<usize> {
+    let needle = crate::search::fold(needle);
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    if let Some(id) = first_with_text(dom, needle) {
+        return Some(id);
+    }
+
+    // A phrase can straddle an inline tag — `la <em>resonancia</em> de` is two
+    // text runs — and FTS5 matches terms that need not be adjacent at all. The
+    // longest word is the most distinctive thing guaranteed to sit inside one
+    // run, so fall back to that before giving up on the page.
+    let longest = needle.split_whitespace().max_by_key(|w| w.chars().count())?;
+    (longest.chars().count() >= 4 && longest != needle)
+        .then(|| first_with_text(dom, longest))
+        .flatten()
+}
+
+fn first_with_text(dom: &BaseDocument, folded_needle: &str) -> Option<usize> {
+    let mut found = None;
+    walk_elements(dom, 0, &mut |id, el| {
+        if found.is_some() {
+            return;
+        }
+        if let Some(tl) = el.inline_layout_data.as_ref() {
+            if crate::search::fold(&tl.text).contains(folded_needle) {
+                found = Some(id);
+            }
+        }
+    });
+    found
+}
+
 /// The node a page begins at — the first atom at or after the page top.
 /// This is what a CFI is generated from.
 pub fn node_at(dom: &BaseDocument, y: f32) -> Option<usize> {
@@ -431,10 +468,14 @@ pub fn viewport(width: u32, height: u32, scale: f32, dark: bool) -> Viewport {
 
 /// Walk the layout tree accumulating absolute Y to find the flow's full height.
 /// `final_layout` is parent-relative, so this cannot be read off the root.
-fn walk_elements(dom: &BaseDocument, id: usize, f: &mut impl FnMut(&blitz_dom::ElementData)) {
+fn walk_elements(
+    dom: &BaseDocument,
+    id: usize,
+    f: &mut impl FnMut(usize, &blitz_dom::ElementData),
+) {
     let Some(node) = dom.get_node(id) else { return };
     if let blitz_dom::NodeData::Element(el) = &node.data {
-        f(el);
+        f(id, el);
     }
     for child in &node.children {
         walk_elements(dom, *child, f);
@@ -528,6 +569,35 @@ mod tests {
 
         let edges: Vec<(f32, f32)> = bands.iter().map(|b| (b.top, b.bottom)).collect();
         assert_eq!(edges, [(100.0, 400.0), (400.0, 450.0)]);
+    }
+
+    /// Following a search hit has to land on the word: an unaccented query must
+    /// find the accented text, and a phrase broken by an inline tag must still
+    /// resolve rather than dumping the reader at the chapter top.
+    #[test]
+    fn a_search_hit_locates_its_text() {
+        let st = style();
+        let vp = viewport(900, 1000, 1.0, false);
+        let doc = layout_fragment(
+            "<p id=\"a\">Nada aquí.</p>\
+             <p id=\"b\">Sin embargo, la resonancia de la <em>tipografía</em> siempre.</p>",
+            &st,
+            vp,
+        );
+
+        let hit = super::node_containing_text(&doc, "resonancia").expect("plain word");
+        let top = super::node_top(&doc, hit).expect("hit has a position");
+        assert!(top > 0.0, "the hit is in the second paragraph, not the first");
+
+        // Accents folded, the way the index matched it.
+        assert_eq!(super::node_containing_text(&doc, "RESONANCIA"), Some(hit));
+        assert_eq!(super::node_containing_text(&doc, "tipografia"), Some(hit));
+
+        // The phrase spans an <em>, so only the longest-word fallback can find it.
+        assert!(super::node_containing_text(&doc, "de la tipografia siempre").is_some());
+
+        assert_eq!(super::node_containing_text(&doc, "   "), None);
+        assert_eq!(super::node_containing_text(&doc, "zzzznotaword"), None);
     }
 
     /// Content inside a table but outside every row — a caption — is still an
