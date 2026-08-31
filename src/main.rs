@@ -1202,13 +1202,18 @@ impl App {
     }
 
     /// What the foot of the page says.
+    ///
+    /// Both readings are about the whole book. An unmeasured layout used to fall
+    /// back to the chapter's own numbering — true, but "page 3 of 8" beside a
+    /// book you are 37% through reads as a bug, and two columns hit it every
+    /// time because halving the column width is a different layout.
     fn readout(&self) -> String {
-        match self.show_page {
-            true => {
+        match (self.show_page, self.measured_pages().is_some()) {
+            (true, true) => {
                 let (page, total) = self.book_page();
                 format!("page {page} of {total}")
             }
-            false => format!("{}%", (self.progress() * 100.0).round() as u8),
+            _ => format!("{}%", (self.progress() * 100.0).round() as u8),
         }
     }
 
@@ -1401,6 +1406,9 @@ impl App {
         style::set_setting("font-scale", &format!("{scale:.2}"));
         println!("omaread: {:.0}px", self.style.font_px());
         self.restyle();
+        if self.show_page {
+            self.measure_book();
+        }
     }
 
     fn toggle_columns(&mut self) {
@@ -1415,8 +1423,12 @@ impl App {
             }
         );
         // The document is laid out at column width, so the flow has to be
-        // re-measured.
+        // re-measured — and page numbers are counted per layout, so they are
+        // too. Only on a deliberate change: a window drag is a layout per pixel.
         self.relayout();
+        if self.show_page {
+            self.measure_book();
+        }
         self.request_redraw();
     }
 
