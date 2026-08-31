@@ -80,6 +80,7 @@ pub fn html(
     <span class="title">Library ({heading})</span>
     <span class="meta"> · sorted by {sort}</span>
   </div>
+  <span class="gear" data-menu="settings" data-icon="gear"></span>
   {search}
 </div>
 {body}
@@ -197,6 +198,106 @@ fn card(index: usize, b: &BookRow, with_cover: bool) -> String {
     )
 }
 
+/// The settings panel: the reading theme, and the folders scanned for books.
+///
+/// Two settings is what there is. It is a document painted over the grid, like
+/// the HUD over a page — not a second window, and not a rebuild of the shelf.
+pub fn menu_html(theme: &str, folders: &[String], adding: Option<&str>) -> String {
+    let themes: String = ["White", "Sepia", "Grey", "Night"]
+        .iter()
+        .map(|t| {
+            format!(
+                r#"<div class="row{on}" data-set="theme:{low}"><span class="tick">{mark}</span>{t}</div>"#,
+                low = t.to_lowercase(),
+                on = if *t == theme { " on" } else { "" },
+                mark = if *t == theme { "•" } else { "" },
+            )
+        })
+        .collect();
+
+    let dirs: String = folders
+        .iter()
+        .map(|f| {
+            format!(
+                r#"<div class="row" data-set="drop:{f}"><span class="tick">×</span>{f}</div>"#,
+                f = escape(f)
+            )
+        })
+        .collect();
+
+    let add = match adding {
+        Some(typed) => format!(
+            r#"<div class="row typing"><span class="tick">+</span>{}<span class="caret">|</span></div>"#,
+            escape(typed)
+        ),
+        None => r#"<div class="row" data-set="add"><span class="tick">+</span>Add a folder…</div>"#
+            .to_string(),
+    };
+
+    format!(
+        r#"<!DOCTYPE html><html><body><div class="menu">
+  <div class="head">Theme</div>
+  {themes}
+  <div class="head">Folders scanned for books</div>
+  {dirs}
+  {add}
+  <div class="foot">Enter to add · click a folder to drop it · F5 rescans · Esc closes</div>
+</div></body></html>"#
+    )
+}
+
+/// Width of the panel. The window places it, so it has to know how wide it is.
+pub const MENU_W: f32 = 520.0;
+
+/// `left` and `top` put the panel under the cog that opened it, in window CSS
+/// pixels — a menu that opens somewhere else is a menu you have to look for.
+pub fn menu_stylesheet(fg: &str, subtle: &str, panel: &str, left: f32, top: f32) -> String {
+    format!(
+        r#"
+html {{
+  box-sizing: border-box;
+  font-family: "Literata", "Charis SIL", serif;
+  background: transparent;
+  color: {fg};
+}}
+html *, html *::before, html *::after {{ box-sizing: inherit; }}
+html body {{ margin: 0; padding: {top}px 0 0 {left}px; background: transparent; }}
+html .menu {{
+  width: {MENU_W}px;
+  padding: 14px 0 10px 0;
+  border-radius: 12px;
+  border: 1px solid {subtle};
+  background: {panel};
+  font-size: 16px;
+}}
+html .head {{
+  padding: 8px 22px 4px 22px;
+  font-size: 13px;
+  color: {subtle};
+}}
+html .row {{
+  display: flex;
+  padding: 5px 12px;
+  margin: 0 10px;
+  border-radius: 7px;
+}}
+/* The setting in force, in the same blue the selection and the caret use. */
+html .row.on {{
+  font-weight: 600;
+  background: rgba(10, 132, 255, 0.20);
+}}
+html .tick {{ width: 22px; color: {subtle}; }}
+html .row.on .tick {{ color: #0a84ff; }}
+html .caret {{ color: #0a84ff; }}
+html .foot {{
+  padding: 10px 22px 2px 22px;
+  font-size: 12px;
+  color: {subtle};
+}}
+"#
+    )
+}
+
 /// The library's own stylesheet, supplied as a UA sheet.
 ///
 /// Every selector is prefixed with `html` for the same reason the reading
@@ -228,6 +329,16 @@ html .bar {{
 html .brand {{ flex-grow: 1; }}
 html .title {{ font-size: 34px; font-weight: 600; }}
 html .meta {{ font-size: 14px; color: {subtle}; padding-left: 14px; }}
+
+/* An empty box the window paints the cog into — the bundled faces carry no
+   symbol glyphs, so every icon here is drawn (CONTEXT.md §9). `display: flex`
+   because an inline-block inside text has no Taffy box to paint into. */
+html .gear {{
+  display: flex;
+  width: 22px;
+  height: 22px;
+  margin-top: 8px;
+}}
 
 /* The search column sits at the right of the bar. */
 html .search {{ width: 420px; padding-left: 28px; }}
@@ -501,6 +612,27 @@ mod tests {
             assert!(split.is_none(), "page at {t} cuts the card at {split:?}");
         }
         assert!(doc.pages.count() > 1, "the fixture must span several pages");
+    }
+
+    /// The panel says which theme is on and which folders are watched, and a
+    /// folder path is a string off the filesystem like any other.
+    #[test]
+    fn the_settings_panel_marks_what_is_set_and_escapes_paths() {
+        let dirs = vec!["/home/x/Documents".to_string(), "/tmp/<b>".to_string()];
+        let out = menu_html("Night", &dirs, None);
+
+        assert!(out.contains(r#"data-set="theme:night""#), "{out}");
+        assert!(out.contains(r#"class="row on" data-set="theme:night""#), "the one in use");
+        assert_eq!(out.matches("row on").count(), 1, "exactly one theme is current");
+        assert!(out.contains(r#"data-set="drop:/home/x/Documents""#));
+        assert!(!out.contains("<b>"), "a path injected markup");
+        assert!(out.contains(r#"data-set="add""#), "somewhere to add one");
+
+        // While a path is being typed the add row becomes the field.
+        let typing = menu_html("Sepia", &dirs, Some("~/Books"));
+        assert!(typing.contains("~/Books"), "{typing}");
+        assert!(typing.contains("caret"));
+        assert!(!typing.contains(r#"data-set="add""#), "no button while typing into it");
     }
 
     /// The CSS cap and the arithmetic arrow keys use must not drift apart.

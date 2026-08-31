@@ -227,6 +227,8 @@ pub enum Icon {
     Highlight,
     /// A left-pointing triangle: back to the library.
     Back,
+    /// A cog: settings.
+    Gear,
 }
 
 /// Draw an icon inside a rectangle given in CSS pixels.
@@ -297,6 +299,37 @@ pub fn icon(scene: &mut impl PaintScene, which: Icon, rect: (f32, f32, f32, f32)
                 [(0.68, 0.12), (0.68, 0.88), (0.22, 0.5)].into_iter().enumerate()
             {
                 let p = at(ux, uy);
+                match i {
+                    0 => path.move_to(p),
+                    _ => path.line_to(p),
+                }
+            }
+            path.close_path();
+        }
+        // Eight teeth around a hub, then a hole punched through the middle:
+        // NonZero would fill the hole, so the ring is wound the other way.
+        Icon::Gear => {
+            let teeth = 8;
+            for i in 0..teeth * 2 {
+                let wide = i % 2 == 0;
+                let r = if wide { 0.5 } else { 0.34 };
+                let a0 = (i as f64) * std::f64::consts::TAU / (teeth as f64 * 2.0);
+                let a1 = a0 + std::f64::consts::TAU / (teeth as f64 * 2.0);
+                for (n, a) in [a0, a1].into_iter().enumerate() {
+                    let p = at(0.5 + r * a.cos(), 0.5 + r * a.sin());
+                    match i == 0 && n == 0 {
+                        true => path.move_to(p),
+                        false => path.line_to(p),
+                    }
+                }
+            }
+            path.close_path();
+            let hole = 0.16;
+            for i in 0..=12 {
+                // Clockwise, against the teeth, so the even-odd of the winding
+                // leaves the middle empty.
+                let a = -(i as f64) * std::f64::consts::TAU / 12.0;
+                let p = at(0.5 + hole * a.cos(), 0.5 + hole * a.sin());
                 match i {
                     0 => path.move_to(p),
                     _ => path.line_to(p),

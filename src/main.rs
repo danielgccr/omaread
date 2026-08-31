@@ -48,6 +48,9 @@ const SELECTION: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x40);
 pub const CARD_OUTLINE: Color = Color::from_rgb8(0x0a, 0x84, 0xff);
 /// The card under the pointer. Light enough to read the cover through.
 const HOVER: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x24);
+/// A settings row under the pointer. Neutral, not the accent: the row already
+/// *in force* is tinted blue, and two blues a shade apart say nothing.
+const MENU_HOVER: Color = Color::from_rgba8(0x80, 0x80, 0x80, 0x38);
 /// The HUD control under the pointer. Heavier than the card wash: it sits on a
 /// flat panel rather than a photograph, so a cover-safe tint reads as nothing.
 const HUD_HOVER: Color = Color::from_rgba8(0x0a, 0x84, 0xff, 0x3d);
@@ -401,6 +404,8 @@ struct App {
     hover_card: Option<usize>,
     /// The `data-hud` control under the pointer, same idea.
     hover_hud: Option<String>,
+    /// And the `data-set` row of the settings panel under it.
+    hover_menu: Option<String>,
     /// Where the reader was before following a link or a contents entry, so the
     /// bar can offer them the way back: the chapter, its page, and how to say so.
     ///
@@ -410,6 +415,12 @@ struct App {
     back: Option<(usize, usize, String)>,
     /// A footnote or reference on show over the page.
     popup: Option<Chapter>,
+    /// The settings panel over the library, and the folder path being typed
+    /// into it, if any.
+    menu: Option<Chapter>,
+    /// Where the panel was anchored when it opened, in window CSS pixels.
+    menu_at: Option<(f32, f32)>,
+    adding_folder: Option<String>,
     /// A page turn in flight: the page being left, and which way it went.
     ///
     /// ponytail: within one chapter only. Turning across a chapter boundary
@@ -507,9 +518,13 @@ impl App {
             lib_page: 0,
             hover_card: None,
             hover_hud: None,
+            hover_menu: None,
             slide: None,
             back: None,
             popup: None,
+            menu: None,
+            menu_at: None,
+            adding_folder: None,
             tagging: None,
             toc_doc: None,
             hud_doc: None,
@@ -543,7 +558,13 @@ impl App {
                 scale: style::setting("font-scale")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1.0),
-                ..ReadingStyle::default()
+                theme: match style::setting("theme").as_deref() {
+                    Some("white") => Theme::White,
+                    Some("grey") => Theme::Grey,
+                    Some("night") => Theme::Night,
+                    Some("sepia") => Theme::Sepia,
+                    _ => ReadingStyle::default().theme,
+                },
             },
             chrome: style::omarchy_chrome(),
             chapter: None,
@@ -1037,6 +1058,130 @@ impl App {
         let node = chapter::text_element(ch.dom(), hit.node_id)?;
         let (ox, oy) = chapter::node_origin(ch.dom(), node)?;
         Some((node, fx - ox, fy - oy))
+    }
+
+    /// Open the settings panel under the cog, and remember where that was.
+    ///
+    /// The anchor is taken once, here. Changing the theme drops the shelf
+    /// document to rebuild it with the new palette, and a panel that asked the
+    /// shelf where the cog is *while it was gone* jumped to the left margin.
+    fn open_menu(&mut self) {
+        // The cog is in the shelf's flow, and the shelf is a page, so its window
+        // position is the flow position plus the page margin. Clamped so a cog
+        // near the right edge does not hang the panel off the screen.
+        let win_w = self.size.0 as f32 / self.scale;
+        let margin = self.page_margin();
+        self.menu_at = self
+            .lib_doc
+            .as_ref()
+            .and_then(|d| find_by_attr(d.dom(), 0, "data-icon", "gear"))
+            .and_then(|n| chapter::node_rect(self.lib_doc.as_ref()?.dom(), n))
+            .map(|(x, y, _, h)| {
+                (
+                    (x - 10.0).clamp(
+                        grid::SIDE_PAD as f32,
+                        (win_w - grid::MENU_W - grid::SIDE_PAD as f32).max(0.0),
+                    ),
+                    y + h + margin + 10.0,
+                )
+            });
+        self.build_menu();
+    }
+
+    /// Lay out the settings panel where `open_menu` put it.
+    fn build_menu(&mut self) {
+        let (_, fg, subtle, panel) = self.chrome();
+        let (left, top) = self.menu_at.unwrap_or((grid::SIDE_PAD as f32, 74.0));
+        let folders: Vec<String> =
+            library::folders().iter().map(|p| p.display().to_string()).collect();
+        let html = grid::menu_html(
+            &format!("{:?}", self.style.theme),
+            &folders,
+            self.adding_folder.as_deref(),
+        );
+        let vp = chapter::viewport(
+            self.size.0,
+            self.size.1,
+            self.scale,
+            self.style.theme == Theme::Night,
+        );
+        self.menu = chapter::layout_document(
+            html,
+            grid::menu_stylesheet(&fg, &subtle, &panel, left, top),
+            None,
+            vp,
+            self.page_height(),
+        );
+        self.request_redraw();
+    }
+
+    /// The panel row under the pointer, by its `data-set` name.
+    fn menu_under_pointer(&self) -> Option<String> {
+        let menu = self.menu.as_ref()?;
+        let (x, y) = (self.cursor.0 / self.scale, self.cursor.1 / self.scale);
+        let hit = menu.doc.hit(x, y)?;
+        ancestor_attr(menu.dom(), hit.node_id, "data-set")
+    }
+
+    /// A press inside the settings panel. Returns false when the panel is not
+    /// open, or the press missed every control — which closes it.
+    fn menu_action(&mut self) -> bool {
+        if self.menu.is_none() {
+            return false;
+        }
+        let Some(what) = self.menu_under_pointer() else {
+            self.menu = None;
+            self.adding_folder = None;
+            self.request_redraw();
+            return true;
+        };
+
+        match what.split_once(':') {
+            Some(("theme", name)) => {
+                self.style.theme = match name {
+                    "white" => Theme::White,
+                    "grey" => Theme::Grey,
+                    "night" => Theme::Night,
+                    _ => Theme::Sepia,
+                };
+                style::set_setting("theme", name);
+                self.lib_doc = None;
+                self.hud_doc = None;
+            }
+            Some(("drop", path)) => {
+                let keep: Vec<std::path::PathBuf> = library::folders()
+                    .into_iter()
+                    .filter(|p| p.display().to_string() != path)
+                    .collect();
+                if let Err(e) = library::set_folders(&keep) {
+                    eprintln!("omaread: {e}");
+                }
+            }
+            _ if what == "add" => self.adding_folder = Some(String::new()),
+            _ => {}
+        }
+        self.build_menu();
+        true
+    }
+
+    /// Add whatever folder was typed, and pick up what is in it.
+    fn add_folder(&mut self) {
+        let Some(typed) = self.adding_folder.take() else { return };
+        let dir = library::expand_home(typed.trim());
+        if !dir.is_dir() {
+            eprintln!("omaread: {} is not a folder", dir.display());
+            self.build_menu();
+            return;
+        }
+        let mut dirs = library::folders();
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+        if let Err(e) = library::set_folders(&dirs) {
+            eprintln!("omaread: {e}");
+        }
+        self.rescan();
+        self.build_menu();
     }
 
     /// Follow whatever `<a>` is under the pointer. Returns true when it dealt
@@ -2054,9 +2199,19 @@ impl App {
             ),
             _ => (None, None),
         };
-        let icons = match showing_hud {
-            true => self.hud_icons(),
-            false => Vec::new(),
+        let icons = match (showing_hud, self.view) {
+            (true, _) => self.hud_icons(),
+            // The library's own control: the cog left of the search box.
+            (false, View::Library) => self
+                .lib_doc
+                .as_ref()
+                .and_then(|d| find_by_attr(d.dom(), 0, "data-icon", "gear"))
+                .and_then(|n| {
+                    let d = self.lib_doc.as_ref()?;
+                    Some(vec![(paint::Icon::Gear, chapter::node_rect(d.dom(), n)?)])
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
         };
         let ink = parse_hex(&self.chrome().1);
 
@@ -2064,6 +2219,7 @@ impl App {
         // closure needs the document mutably to set the page offset. That rules
         // out `doc_mut`, which borrows all of `self`.
         let hover_hud = self.hover_hud.clone();
+        let hover_menu = self.hover_menu.clone();
         // How far through a page turn this frame is, eased out, and which page
         // is on its way off. Only in the reading view: the library rebuilds its
         // grid on a page turn to fetch that page's covers, so the outgoing page
@@ -2072,7 +2228,7 @@ impl App {
             let t = s.at.elapsed().as_secs_f32() / SLIDE.as_secs_f32();
             (t < 1.0).then(|| (s, 1.0 - (1.0 - t) * (1.0 - t)))
         });
-        let App { renderer, chapter, lib_doc, toc_doc, hud_doc, popup, view, .. } = self;
+        let App { renderer, chapter, lib_doc, toc_doc, hud_doc, popup, menu, view, .. } = self;
         let hud = if showing_hud { hud_doc.as_mut() } else { None };
         let Some(ch) = (match view {
             View::Library => lib_doc.as_mut(),
@@ -2180,6 +2336,24 @@ impl App {
                 if let Some(note) = popup.as_mut() {
                     paint::overlay(scene, &mut note.doc, &frame);
                 }
+                // The library's cog, in flow coordinates like the selection
+                // outline: the shelf is a page, so it carries the page margin.
+                if matches!(view, View::Library) {
+                    let (top, _) = slices.first().copied().unwrap_or((0.0, 0.0));
+                    for &(icon, (cx, cy, cw, chh)) in &icons {
+                        paint::icon(scene, icon, (cx, cy - top + margin, cw, chh), ink, scale);
+                    }
+                }
+                if let Some(m) = menu.as_mut() {
+                    paint::overlay(scene, &mut m.doc, &frame);
+                    if let Some(rect) = hover_menu
+                        .as_deref()
+                        .and_then(|r| find_by_attr(m.dom(), 0, "data-set", r))
+                        .and_then(|n| chapter::node_rect(m.dom(), n))
+                    {
+                        paint::wash(scene, rect, MENU_HOVER, scale);
+                    }
+                }
                 if let Some(hud) = hud {
                     paint::overlay(scene, &mut hud.doc, &frame);
                     for &(icon, rect) in &icons {
@@ -2217,6 +2391,38 @@ impl App {
 
     fn library_key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
         let cols = self.cards_per_row();
+
+        // The panel takes every key while it is up, the same way the tag box
+        // below takes every letter while it is being typed.
+        if self.menu.is_some() {
+            match (key, self.adding_folder.is_some()) {
+                (Key::Named(NamedKey::Escape), true) => self.adding_folder = None,
+                (Key::Named(NamedKey::Escape), false) => self.menu = None,
+                (Key::Named(NamedKey::Enter), true) => return self.add_folder(),
+                (Key::Named(NamedKey::Backspace), true) => {
+                    if let Some(t) = self.adding_folder.as_mut() {
+                        t.pop();
+                    }
+                }
+                (Key::Character(c), true) => {
+                    if let Some(t) = self.adding_folder.as_mut() {
+                        t.push_str(c.as_str());
+                    }
+                }
+                (Key::Named(NamedKey::Space), true) => {
+                    if let Some(t) = self.adding_folder.as_mut() {
+                        t.push(' ');
+                    }
+                }
+                (Key::Named(NamedKey::F5), _) => self.rescan(),
+                _ => return,
+            }
+            match self.menu.is_some() {
+                true => self.build_menu(),
+                false => self.request_redraw(),
+            }
+            return;
+        }
 
         // While a tag is being typed every letter is tag text, so this runs
         // before the search-and-navigate keys below.
@@ -2330,6 +2536,12 @@ impl App {
         let Some(hit) = doc.doc.hit(x, y) else { return };
         match self.view {
             View::Library => {
+                // The gear opens the panel; a press anywhere else in it is
+                // handled by `menu_action`, which ran before this.
+                if ancestor_attr(doc.dom(), hit.node_id, "data-menu").is_some() {
+                    self.open_menu();
+                    return;
+                }
                 // A suggestion is a click target too; check it first, since a
                 // card and a suggestion are both just boxes in this document.
                 if let Some(text) = ancestor_attr(doc.dom(), hit.node_id, "data-suggest") {
@@ -2421,6 +2633,7 @@ impl App {
                         Theme::Night => Theme::White,
                     };
                     println!("omaread: theme {:?}", self.style.theme);
+                    style::set_setting("theme", &format!("{:?}", self.style.theme).to_lowercase());
                     self.restyle();
                 }
                 "+" | "=" => self.set_font_scale(self.style.scale + 0.1),
@@ -2652,7 +2865,10 @@ impl ApplicationHandler for App {
         match event {
             // The pointer left, so nothing is under it.
             WindowEvent::CursorLeft { .. } => {
-                if self.hover_card.take().is_some() | self.hover_hud.take().is_some() {
+                if self.hover_card.take().is_some()
+                    | self.hover_hud.take().is_some()
+                    | self.hover_menu.take().is_some()
+                {
                     self.request_redraw();
                 }
             }
@@ -2689,6 +2905,11 @@ impl ApplicationHandler for App {
                         self.hover_hud = on;
                         self.request_redraw();
                     }
+                    let row = self.menu_under_pointer();
+                    if row != self.hover_menu {
+                        self.hover_menu = row;
+                        self.request_redraw();
+                    }
                 }
             }
 
@@ -2705,6 +2926,8 @@ impl ApplicationHandler for App {
                             self.begin_selection();
                         }
                     }
+                    // The panel is over the shelf, so it gets the press first.
+                    ElementState::Pressed if self.menu_action() => {}
                     ElementState::Pressed => self.on_click(),
                     ElementState::Released => {
                         self.dragging = false;

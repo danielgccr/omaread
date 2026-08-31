@@ -21,6 +21,24 @@ pub fn folders_file() -> PathBuf {
         .join("omaread/folders.txt")
 }
 
+/// What both writers put at the top of `folders.txt`.
+const HEADER: &str = "# Folders Omaread scans. One path per line.\n\
+                      # These are read-only: Omaread never renames or moves files here.";
+
+/// Replace the watched folder list. One path per line, as it was read.
+pub fn set_folders(dirs: &[PathBuf]) -> Result<(), String> {
+    let file = folders_file();
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body: String = HEADER
+        .lines()
+        .map(|l| format!("{l}\n"))
+        .chain(dirs.iter().map(|p| format!("{}\n", p.display())))
+        .collect();
+    std::fs::write(&file, body).map_err(|e| format!("write {}: {e}", file.display()))
+}
+
 /// Watched folders, seeded with the obvious ones on first run.
 pub fn folders() -> Vec<PathBuf> {
     let file = folders_file();
@@ -47,14 +65,11 @@ pub fn folders() -> Vec<PathBuf> {
         .iter()
         .map(|p| format!("{}\n", p.display()))
         .collect();
-    let _ = std::fs::write(
-        &file,
-        format!("# Folders Omaread scans. One path per line.\n# These are read-only: Omaread never renames or moves files here.\n{body}"),
-    );
+    let _ = std::fs::write(&file, format!("{HEADER}\n{body}"));
     seeded
 }
 
-fn expand_home(s: &str) -> PathBuf {
+pub fn expand_home(s: &str) -> PathBuf {
     match s.strip_prefix("~/") {
         Some(rest) => std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join(rest))
