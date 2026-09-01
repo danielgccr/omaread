@@ -688,6 +688,20 @@ fn first_with_text(dom: &BaseDocument, folded_needle: &str) -> Option<usize> {
     found
 }
 
+/// Character offset within `id` of the first character at or below `y`.
+///
+/// A page rarely begins where a paragraph does: the CFI names the paragraph, so
+/// on its own it can only resume where that paragraph *started*, which for the
+/// long ones is a page or two back. This is the rest of the address.
+pub fn char_at(dom: &BaseDocument, id: usize, y: f32) -> Option<usize> {
+    let tl = text_layout(dom, id)?;
+    let (_, oy) = node_origin(dom, id)?;
+    let local = y - oy;
+    let line = tl.layout.lines().find(|l| l.metrics().max_coord > local)?;
+    let byte = line.text_range().start;
+    Some(tl.text.get(..byte)?.chars().count())
+}
+
 /// The node a page begins at — the first atom at or after the page top.
 /// This is what a CFI is generated from.
 pub fn node_at(dom: &BaseDocument, y: f32) -> Option<usize> {
@@ -782,6 +796,43 @@ fn content_height(dom: &BaseDocument) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// Save and restore have to agree about *which page*, not which paragraph.
+    /// A paragraph three pages long used to resume at its first page, because
+    /// the CFI named the element and nothing else.
+    #[test]
+    fn a_page_inside_a_long_paragraph_comes_back_to_itself() {
+        let long = "Una frase que se repite para llenar varias paginas de texto. ".repeat(400);
+        let doc = super::layout_document(
+            format!("<html><body><p>{long}</p></body></html>"),
+            crate::style::ReadingStyle::default().stylesheet(),
+            None,
+            super::viewport(900, 700, 1.0, false),
+            600.0,
+        )
+        .expect("the page must lay out");
+
+        assert!(doc.pages.count() > 3, "the fixture must span pages");
+        for page in 0..doc.pages.count() {
+            let top = doc.pages.top_of(page);
+            let node = super::node_at(doc.dom(), top).expect("no node at the page top");
+
+            // Saved: the paragraph, and which character of it the page starts on.
+            let off = super::char_at(doc.dom(), node, top).expect("no character offset");
+            // Restored: that character's own line decides the page.
+            let y = super::highlight_rects(doc.dom(), node, off, 1)
+                .first()
+                .map(|r| r.1)
+                .expect("the character has no box");
+
+            assert_eq!(doc.pages.page_containing(y), page, "page {page} came back wrong");
+        }
+
+        // Without the offset every page of that paragraph resolves to the first.
+        let node = super::node_at(doc.dom(), doc.pages.top_of(2)).unwrap();
+        let bare = super::node_top(doc.dom(), node).unwrap();
+        assert_eq!(doc.pages.page_containing(bare), 0, "the paragraph starts on page 1");
+    }
+
     /// A cover that reaches the engine as an empty tree gets the book's name; a
     /// cover that actually paints must keep its image.
     #[test]

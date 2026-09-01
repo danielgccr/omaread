@@ -200,7 +200,12 @@ html hr {{
   margin: 2em auto;
   width: 30%;
 }}
-sup, sub {{ line-height: 0; }}
+/* A note reference is a superscript, and blitz's own UA sheet does not make it
+   one — the number sat on the baseline at full size, reading as part of the
+   sentence. */
+sup, sub {{ line-height: 0; font-size: 0.72em; }}
+sup {{ vertical-align: super; }}
+sub {{ vertical-align: sub; }}
 "#
         )
     }

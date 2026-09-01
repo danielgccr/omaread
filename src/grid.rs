@@ -80,8 +80,8 @@ pub fn html(
     <span class="title">Library ({heading})</span>
     <span class="meta"> · sorted by {sort}</span>
   </div>
-  <span class="gear" data-menu="settings" data-icon="gear"></span>
   {search}
+  <span class="gear" data-menu="settings" data-icon="gear"></span>
 </div>
 {body}
 </body></html>"#,
@@ -179,7 +179,7 @@ fn card(index: usize, b: &BookRow, with_cover: bool) -> String {
     format!(
         r#"<div class="{classes}" data-atom data-index="{index}" data-hash="{hash}">
   {cover}
-  <div class="dot">{dot}</div>
+  {progress}
   <div class="name">{title}</div>
   <div class="by">{author}</div>
   {tags}
@@ -191,10 +191,18 @@ fn card(index: usize, b: &BookRow, with_cover: bool) -> String {
                 escape(&b.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "))
             ),
         },
+        // A book you are 40% through says so; the old blue dot only said
+        // "started", which is the least interesting thing about it.
+        progress = match b.started {
+            true => format!(
+                r#"<div class="prog"><div class="fill" style="width: {}%"></div></div>"#,
+                (b.progress.clamp(0.0, 1.0) * 100.0).round() as u32
+            ),
+            false => r#"<div class="prog"></div>"#.to_string(),
+        },
         hash = escape(&b.hash),
         title = escape(&clamp(&b.title, 34)),
         author = escape(&clamp(if b.missing { "file missing" } else { &b.author }, 24)),
-        dot = if b.started { "•" } else { "" },
     )
 }
 
@@ -338,6 +346,7 @@ html .gear {{
   width: 22px;
   height: 22px;
   margin-top: 8px;
+  margin-left: 18px;
 }}
 
 /* The search column sits at the right of the bar. */
@@ -403,7 +412,17 @@ html .cover {{
 }}
 html .cover.blank {{ background: {panel}; }}
 
-html .dot {{ height: 12px; font-size: 15px; color: #0a84ff; }}
+/* Same 12px slot the started dot had, so `CARD_H` is unchanged. An unread
+   book gets the empty slot: a track drawn on every card would read as 361
+   books all at zero. */
+/* The rule and its padding are the 12px the started dot used to take, so
+   `CARD_H` is unchanged. Padding, not a margin: 4px of clear air under the
+   cover that no margin collapsing can eat.
+
+   No track behind the fill — on a dark theme the unread part read as a black
+   bar stuck to the cover. How far along the blue reaches is the whole message. */
+html .prog {{ height: 12px; padding-top: 4px; }}
+html .fill {{ height: 4px; border-radius: 2px; background: #0a84ff; }}
 html .name {{ font-size: 21px; line-height: 1.25; }}
 html .by {{ font-size: 18px; color: {subtle}; padding-top: 3px; }}
 html .tags {{ font-size: 11px; color: {subtle}; padding-top: 3px; }}
@@ -606,6 +625,15 @@ mod tests {
             );
         }
 
+        // The shelf begins below the bar. `.bar` was once the class on both the
+        // heading and the progress rule, and the second `html .bar` rule shrank
+        // the heading to 12px — the covers climbed over the title and the
+        // search box.
+        assert!(
+            tops.first().is_some_and(|&y| y > 60.0),
+            "the first row sits under the heading: {tops:?}"
+        );
+
         // And no page starts in the middle of one.
         for &t in &doc.pages.tops {
             let split = tops.iter().find(|&&y| t > y + 1.0 && t < y + CARD_H as f32 - 1.0);
@@ -633,6 +661,63 @@ mod tests {
         assert!(typing.contains("~/Books"), "{typing}");
         assert!(typing.contains("caret"));
         assert!(!typing.contains(r#"data-set="add""#), "no button while typing into it");
+    }
+
+    /// The bar has to be a real box a third of the card wide, not just markup:
+    /// a percentage width that does not resolve paints nothing at all.
+    #[test]
+    fn the_progress_bar_is_as_wide_as_the_book_is_read() {
+        let mut r = row("Un libro", "Autor");
+        r.started = true;
+        r.progress = 0.5;
+        let doc = crate::chapter::layout_document(
+            html(&[r], "", Sort::Recent, &[], None, 0..1),
+            stylesheet("#fff", "#111", "#888", "#eee"),
+            None,
+            crate::chapter::viewport(1200, 900, 1.0, false),
+            800.0,
+        )
+        .expect("the grid must lay out");
+
+        let fill = crate::find_by_attr(doc.dom(), 0, "class", "fill").expect("no fill box");
+        let (_, _, w, h) = crate::chapter::node_rect(doc.dom(), fill).expect("no rect");
+        assert!(
+            (w - COVER_W as f32 / 2.0).abs() < 2.0,
+            "half-read book should fill half the card: {w} of {COVER_W}"
+        );
+        assert!(h > 0.0, "the bar has no height");
+    }
+
+    /// The cog sits clear of the search box: it is painted into a reserved box,
+    /// so nothing in the markup would complain if the two touched.
+    #[test]
+    fn the_cog_does_not_crowd_the_search_box() {
+        let doc = crate::chapter::layout_document(
+            html(&[], "", Sort::Recent, &[], None, 0..0),
+            stylesheet("#fff", "#111", "#888", "#eee"),
+            None,
+            crate::chapter::viewport(1400, 700, 1.0, false),
+            600.0,
+        )
+        .expect("the grid must lay out");
+
+        let rect = |class: &str| {
+            crate::find_by_attr(doc.dom(), 0, "class", class)
+                .and_then(|n| crate::chapter::node_rect(doc.dom(), n))
+                .unwrap_or_else(|| panic!("no {class} box"))
+        };
+        let search = rect("search");
+        let gear = crate::find_by_attr(doc.dom(), 0, "data-icon", "gear")
+            .and_then(|n| crate::chapter::node_rect(doc.dom(), n))
+            .expect("no cog box");
+
+        assert!(gear.2 > 0.0 && gear.3 > 0.0, "the cog has no box to paint into");
+        assert!(
+            gear.0 - (search.0 + search.2) >= 12.0,
+            "cog at {} against a field ending at {}",
+            gear.0,
+            search.0 + search.2
+        );
     }
 
     /// The CSS cap and the arithmetic arrow keys use must not drift apart.

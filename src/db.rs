@@ -49,6 +49,8 @@ pub struct BookRow {
     pub managed: bool,
     pub missing: bool,
     pub started: bool,
+    /// How far through, 0..1. Zero for a book never opened.
+    pub progress: f32,
     pub tags: Vec<String>,
 }
 
@@ -116,6 +118,9 @@ impl Db {
             "missing INTEGER NOT NULL DEFAULT 0",
             "added_at INTEGER",
             "indexed INTEGER NOT NULL DEFAULT 0",
+            // How far through, 0..1 — the same figure the reading HUD shows.
+            // Recomputing it for a shelf of 361 would mean opening 361 books.
+            "progress REAL NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE books ADD COLUMN {col}"), []);
         }
@@ -189,17 +194,19 @@ impl Db {
         path: &str,
         title: &str,
         cfi: &str,
+        progress: f32,
     ) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT INTO books (file_hash, file_path, title, last_cfi, opened_at)
-                 VALUES (?1, ?2, ?3, ?4, unixepoch())
+                "INSERT INTO books (file_hash, file_path, title, last_cfi, opened_at, progress)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch(), ?5)
                  ON CONFLICT(file_hash) DO UPDATE SET
                      file_path = excluded.file_path,
                      title     = excluded.title,
                      last_cfi  = excluded.last_cfi,
-                     opened_at = excluded.opened_at",
-                params![hash, path, title, cfi],
+                     opened_at = excluded.opened_at,
+                     progress  = excluded.progress",
+                params![hash, path, title, cfi, progress],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -259,7 +266,7 @@ impl Db {
         args.extend(fts);
         let sql = format!(
             "SELECT file_hash, file_path, title, author, cover IS NOT NULL, managed, missing,
-                    last_cfi IS NOT NULL
+                    last_cfi IS NOT NULL, progress
              FROM books
              WHERE (?1 = '%%' OR title LIKE ?1 ESCAPE '\\' OR author LIKE ?1 ESCAPE '\\'{full_text})
              ORDER BY {order}"
@@ -277,6 +284,7 @@ impl Db {
                     managed: r.get::<_, i64>(5)? != 0,
                     missing: r.get::<_, i64>(6)? != 0,
                     started: r.get::<_, i64>(7)? != 0,
+                    progress: r.get::<_, f64>(8)? as f32,
                     tags: Vec::new(),
                 })
             })
@@ -289,7 +297,7 @@ impl Db {
     fn books_tagged(&self, prefix: &str, order: &str) -> Result<Vec<BookRow>, String> {
         let sql = format!(
             "SELECT file_hash, file_path, title, author, cover IS NOT NULL, managed, missing,
-                    last_cfi IS NOT NULL
+                    last_cfi IS NOT NULL, progress
              FROM books
              WHERE file_hash IN (SELECT file_hash FROM tags WHERE tag LIKE ?1)
              ORDER BY {order}"
@@ -307,6 +315,7 @@ impl Db {
                     managed: r.get::<_, i64>(5)? != 0,
                     missing: r.get::<_, i64>(6)? != 0,
                     started: r.get::<_, i64>(7)? != 0,
+                    progress: r.get::<_, f64>(8)? as f32,
                     tags: Vec::new(),
                 })
             })
@@ -924,12 +933,19 @@ mod tests {
 
         assert_eq!(db.last_cfi("h1").unwrap(), None);
 
-        db.save_progress("h1", "/a.epub", "A", "epubcfi(/6/4!/4/2)").unwrap();
+        db.save_progress("h1", "/a.epub", "A", "epubcfi(/6/4!/4/2)", 0.12).unwrap();
         assert_eq!(db.last_cfi("h1").unwrap().as_deref(), Some("epubcfi(/6/4!/4/2)"));
 
         // Same book, moved and further along.
-        db.save_progress("h1", "/moved/a.epub", "A", "epubcfi(/6/8!/4/6)").unwrap();
+        db.save_progress("h1", "/moved/a.epub", "A", "epubcfi(/6/8!/4/6)", 0.4).unwrap();
         assert_eq!(db.last_cfi("h1").unwrap().as_deref(), Some("epubcfi(/6/8!/4/6)"));
+
+        // How far through comes back with the shelf: recomputing it would mean
+        // opening every book.
+        let row = db.books("", Sort::Recent).unwrap().into_iter().find(|b| b.hash == "h1");
+        let row = row.expect("the book is on the shelf");
+        assert!(row.started);
+        assert!((row.progress - 0.4).abs() < 0.001, "{}", row.progress);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -65,8 +65,10 @@ struct Slide {
 /// How long a page takes to slide out of the way. Long enough to see which way
 /// the page went, short enough that holding the key still turns pages quickly.
 const SLIDE: Duration = Duration::from_millis(160);
-/// Wake-up interval while a page is sliding — about 120fps, no busy loop.
-const FRAME: Duration = Duration::from_millis(8);
+/// Wake-up interval while a page is sliding. 60fps: a 160ms slide is ten
+/// frames, and asking for them twice that fast only queues work the compositor
+/// has not been asked for yet.
+const FRAME: Duration = Duration::from_millis(16);
 
 /// How long the reading HUD lingers after the pointer stops moving.
 const HUD_LINGER: Duration = Duration::from_millis(2200);
@@ -128,6 +130,55 @@ mod tests {
                 "at {width}px the layout put {in_row} in a row"
             );
         }
+    }
+
+    /// A superscript note reference is a ten-pixel target inside a sentence.
+    /// Landing beside it has to count, or footnotes are unopenable.
+    #[test]
+    fn a_near_miss_still_finds_the_note_reference() {
+        let html = r##"<html><body><p>Una frase larga que ocupa una linea entera y
+            termina con una nota<sup><a href="#n1">2</a></sup> y sigue despues
+            con mas palabras para llenar la medida.</p>
+            <p id="n1">2 La nota, que es corta.</p></body></html>"##;
+        let doc = crate::chapter::layout_document(
+            html.to_string(),
+            crate::style::ReadingStyle::default().stylesheet(),
+            None,
+            crate::chapter::viewport(900, 700, 1.0, false),
+            600.0,
+        )
+        .expect("the page must lay out");
+
+        // Sweep the paragraph for the one point that is exactly on the glyph.
+        let par = crate::chapter::node_containing_text(doc.dom(), "termina con una nota")
+            .expect("no paragraph");
+        let (px, py, pw, ph) = crate::chapter::node_rect(doc.dom(), par).expect("no box");
+        let mut on: Option<(f32, f32)> = None;
+        let (mut y, mut x) = (py, px);
+        while y < py + ph && on.is_none() {
+            x = px;
+            while x < px + pw {
+                if doc
+                    .doc
+                    .hit(x, y)
+                    .and_then(|h| super::ancestor_attr(doc.dom(), h.node_id, "href"))
+                    .is_some()
+                {
+                    on = Some((x, y));
+                    break;
+                }
+                x += 1.0;
+            }
+            y += 1.0;
+        }
+        let (hx, hy) = on.expect("the link is not hittable anywhere");
+
+        // Six pixels off is a miss for the engine and a hit for a reader.
+        assert_eq!(super::href_at(&doc.doc, hx, hy).as_deref(), Some("#n1"));
+        assert_eq!(super::href_at(&doc.doc, hx - 6.0, hy).as_deref(), Some("#n1"));
+        assert_eq!(super::href_at(&doc.doc, hx, hy + 6.0).as_deref(), Some("#n1"));
+        // Far away is still a miss, or every click would follow something.
+        assert_eq!(super::href_at(&doc.doc, px, py + ph - 1.0), None);
     }
 
     /// A note is shown where you are; a section is somewhere to go.
@@ -1201,8 +1252,7 @@ impl App {
         let href = {
             let Some(ch) = self.chapter.as_ref() else { return false };
             let (fx, fy) = self.pointer_in_flow();
-            let Some(hit) = ch.doc.hit(fx, fy) else { return false };
-            match ancestor_attr(ch.dom(), hit.node_id, "href") {
+            match href_at(&ch.doc, fx, fy) {
                 Some(h) => h,
                 None => return false,
             }
@@ -1891,7 +1941,15 @@ impl App {
             eprintln!("omaread: saved position no longer resolves; starting at the top");
             return;
         };
-        if let Some(y) = chapter::node_top(ch.dom(), node) {
+        // The character the page began on, when the saved position names one;
+        // the paragraph's own top otherwise.
+        let y = c
+            .offset
+            .and_then(|off| {
+                chapter::highlight_rects(ch.dom(), node, off, 1).first().map(|r| r.1)
+            })
+            .or_else(|| chapter::node_top(ch.dom(), node));
+        if let Some(y) = y {
             self.page = ch.pages.page_containing(y);
             println!("omaread: resumed at page {} of {}", self.page + 1, ch.pages.count());
         }
@@ -1903,9 +1961,14 @@ impl App {
         let Ok(db) = db.lock() else { return };
         let top = ch.pages.top_of(self.page);
         let Some(node) = chapter::node_at(ch.dom(), top) else { return };
-        let Some(c) = cfi::of_node(ch.dom(), node, self.index) else { return };
+        let Some(mut c) = cfi::of_node(ch.dom(), node, self.index) else { return };
+        // Which character of it the page starts on. Without this the address is
+        // the paragraph, and a paragraph three pages long resumes at its first.
+        c.offset = chapter::char_at(ch.dom(), node, top);
         let title = self.book.as_ref().map(|b| b.title.as_str()).unwrap_or("");
-        if let Err(e) = db.save_progress(&self.hash, &self.path, title, &c.to_string())
+        let progress = self.progress();
+        if let Err(e) =
+            db.save_progress(&self.hash, &self.path, title, &c.to_string(), progress)
         {
             eprintln!("omaread: could not save position: {e}");
         }
@@ -2739,6 +2802,35 @@ impl App {
     }
 }
 
+/// The `href` under a point in the flow, or within a few pixels of it.
+///
+/// A note reference is a superscript digit — a 10px target in a 660px measure,
+/// and it sits inside a sentence, so the pointer lands beside it as often as on
+/// it. The exact point wins; the ring is only consulted when it hits nothing.
+///
+/// ponytail: eight probes at a fixed radius. Measuring the glyph's own box
+/// would be exact, but an inline element has no Taffy box to measure
+/// (CONTEXT.md §9) — the run lives in the paragraph's parley layout.
+fn href_at(doc: &blitz_html::HtmlDocument, x: f32, y: f32) -> Option<String> {
+    const R: f32 = 7.0;
+    [
+        (0.0, 0.0),
+        (-R, 0.0),
+        (R, 0.0),
+        (0.0, -R),
+        (0.0, R),
+        (-R, -R),
+        (R, -R),
+        (-R, R),
+        (R, R),
+    ]
+    .into_iter()
+    .find_map(|(dx, dy)| {
+        let hit = doc.hit(x + dx, y + dy)?;
+        ancestor_attr(doc, hit.node_id, "href")
+    })
+}
+
 /// Is this link target a note to read here, or a place to go to?
 ///
 /// A footnote, an endnote and a bibliography entry are all a short block of
@@ -2806,7 +2898,7 @@ fn find_by_attr(
 }
 
 /// Walk up from a hit node to the nearest ancestor carrying `attr`.
-fn ancestor_attr(dom: &blitz_dom::BaseDocument, mut id: usize, attr: &str) -> Option<String> {
+pub fn ancestor_attr(dom: &blitz_dom::BaseDocument, mut id: usize, attr: &str) -> Option<String> {
     loop {
         let node = dom.get_node(id)?;
         if let blitz_dom::NodeData::Element(el) = &node.data {
@@ -2959,7 +3051,16 @@ impl ApplicationHandler for App {
                 self.on_key(event_loop, event.logical_key);
             }
 
-            WindowEvent::RedrawRequested => self.redraw(),
+            // The guard is around the whole redraw, not only around painting
+            // the documents: acquiring the surface texture happens outside that
+            // inner one, and wgpu turns a compositor that does not hand a buffer
+            // back in time into `failed to get surface texture: Timeout`. A
+            // frame nobody could present is a frame worth losing, not a window.
+            WindowEvent::RedrawRequested => {
+                if catch_unwind(AssertUnwindSafe(|| self.redraw())).is_err() {
+                    eprintln!("omaread: dropped a frame the compositor would not take");
+                }
+            }
 
             _ => {}
         }
