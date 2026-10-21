@@ -137,8 +137,11 @@ impl Pages {
 
     /// Which page a flow offset falls on. Used to keep the reader's place across
     /// a re-flow, and later to resolve a CFI to a page.
+    ///
+    /// Within `EDGE_EPS`, as the paginator cuts: a break may sit a hair inside
+    /// the line it opens, and that line is this page's, not the one before.
     pub fn page_containing(&self, y: f32) -> usize {
-        match self.tops.iter().position(|&t| t > y) {
+        match self.tops.iter().position(|&t| t > y + EDGE_EPS) {
             Some(i) => i.saturating_sub(1),
             None => self.tops.len().saturating_sub(1),
         }
@@ -604,7 +607,8 @@ mod tests {
         assert_eq!(pages.page_containing(0.0), 0);
         let second = pages.tops[1];
         assert_eq!(pages.page_containing(second), 1);
-        assert_eq!(pages.page_containing(second - 1.0), 0);
+        assert_eq!(pages.page_containing(second - 1.0), 1, "a hair above the cut opens the page");
+        assert_eq!(pages.page_containing(second - 2.0), 0);
         assert_eq!(pages.page_containing(f32::MAX), pages.count() - 1);
     }
 }

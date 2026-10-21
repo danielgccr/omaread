@@ -1100,11 +1100,12 @@ pub fn char_at(dom: &BaseDocument, id: usize, y: f32) -> Option<usize> {
 }
 
 /// The node a page begins at — the first atom at or after the page top.
-/// This is what a CFI is generated from.
+/// This is what a CFI is generated from. A line the break sits a hair above the
+/// foot of (`EDGE_EPS`) is the page before's.
 pub fn node_at(dom: &BaseDocument, y: f32) -> Option<usize> {
     collect_atoms(dom)
         .into_iter()
-        .filter(|a| a.bottom > y)
+        .filter(|a| a.bottom > y + paginate::EDGE_EPS)
         .min_by(|a, b| a.top.total_cmp(&b.top))
         .map(|a| a.group)
 }
@@ -1742,5 +1743,35 @@ mod tests {
         assert_eq!(base_url_for("/a/b/c.xhtml"), format!("{ORIGIN}a/b/"));
         assert_eq!(base_url_for("/ch01.html"), ORIGIN);
         assert_eq!(base_url_for("ch01.html"), ORIGIN);
+    }
+
+
+    /// A theme switch rebuilds the chapter and finds the page again by its
+    /// CFI. The paginator may cut a hair inside a line (`EDGE_EPS`), and
+    /// reading that line as the page before's sent the reader back a page.
+    /// Page heights are swept so some cut lands in that hair.
+    #[test]
+    fn a_page_start_survives_a_rebuild() {
+        let p = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. ".repeat(5);
+        let html = format!(
+            "<html><body style='margin:0;font-size:26px;line-height:1.6'>{}</body></html>",
+            format!("<h2>Head</h2><p>{p}</p><p>{p}</p>").repeat(8)
+        );
+        let doc = super::layout_document(html, String::new(), None, super::viewport(900, 1300, 1.25, false), 910.0)
+            .expect("the page must lay out");
+        let mut wrong = Vec::new();
+        for tenth in 0..420 {
+            let pages = super::paginate_dom(doc.dom(), 900.0 + tenth as f32 / 10.0);
+            for page in 0..pages.count() {
+                let top = pages.top_of(page);
+                let node = super::node_at(doc.dom(), top).expect("no node at the page top");
+                let c = crate::cfi::at(doc.dom(), node, super::char_at(doc.dom(), node, top), 0).expect("no CFI");
+                let y = super::top_of_cfi(&doc, &c).expect("the CFI must resolve");
+                if pages.page_containing(y) != page {
+                    wrong.push((tenth, page));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "came back on the page before: {wrong:?}");
     }
 }
