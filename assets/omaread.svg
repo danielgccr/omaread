@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Open book">
+  <rect width="256" height="256" rx="56" fill="#332b36"/>
+  <path d="M128 70c-22-16-50-21-83-15v133c33-6 61-1 83 15 22-16 50-21 83-15V55c-33-6-61-1-83 15Z" fill="#f4ead9"/>
+  <path d="M128 70v133M62 82c20-1 36 3 49 11M62 107c20-1 36 3 49 11M145 93c13-8 29-12 49-11M145 118c13-8 29-12 49-11" fill="none" stroke="#a27d66" stroke-linecap="round" stroke-linejoin="round" stroke-width="7"/>
+  <path d="M45 188c33-6 61-1 83 15 22-16 50-21 83-15" fill="none" stroke="#c5ac89" stroke-linecap="round" stroke-linejoin="round" stroke-width="7"/>
+</svg>
